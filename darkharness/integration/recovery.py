@@ -1,7 +1,8 @@
 """Controller-only recovery proof/readback, not seat-supplied 'safe' assertions.
 
 Ordinary new attempt retains the original full input and thread/parent lineage.
-No outbox, native UNKNOWN delivery or ambiguous Git intent is refined here.
+Only the evidence-linked SDK4 local mention rejection can refine an outbox.
+Native UNKNOWN delivery and ambiguous Git intent remain fenced.
 """
 from __future__ import annotations
 
@@ -22,6 +23,104 @@ class Recovery:
         with self.owner.transaction(self.owner.epoch) as db:
             db.execute('CREATE TABLE IF NOT EXISTS c_recovery(id TEXT PRIMARY KEY,operation TEXT,attempt TEXT,proof TEXT,continuation TEXT,UNIQUE(operation,attempt))')
 
+    def reject_local_send(self, operation, attempt, outbox_id, body_sha256, evidence_refs):
+        """Refine only the pinned SDK4 empty-cache unknown-mention rejection.
+
+        Controller supplies canonical event references, never a safe/success claim.
+        All validation and the single-row transition share the owner transaction.
+        Does not resume a parent, manufacture inbox work, or replay the rejected ID.
+        """
+        from importlib.metadata import version
+        from band.runtime.tools import agent as sdk_agent
+        pinned = '44364d1704f66b4ad38ad83fa8cfb97fd8666053e00d4d893a39adf8558d7180'
+        if version('band-sdk') != '4.0.0' or digest(Path(sdk_agent.__file__).read_bytes()) != pinned:
+            raise IntegrationError('LOCAL_REJECTION_SDK_PIN_MISMATCH')
+        names = {'intent', 'request', 'callback', 'unknown', 'result', 'completed'}
+        if not all(isinstance(v, str) and v for v in (operation, attempt, outbox_id, body_sha256)) or not isinstance(evidence_refs, dict) or set(evidence_refs) != names:
+            raise IntegrationError('LOCAL_REJECTION_EVIDENCE_REQUIRED')
+        with self.owner.transaction(self.owner.epoch) as db:
+            scope = self.router._scope(db)
+            cap = (scope or {}).get('continuation')
+            if not scope or not isinstance(cap, dict) or operation not in cap.get('operations', []):
+                raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
+            parent = db.execute('SELECT * FROM c_work WHERE id=?', (operation,)).fetchone()
+            row = db.execute('SELECT * FROM c_outbox WHERE id=?', (outbox_id,)).fetchone()
+            if not parent or parent['attempt'] != attempt or parent['seat'] != self.router.seat or parent['room'] != self.router.room or not row or row['operation'] != operation:
+                raise IntegrationError('OWNER_ATTEMPT_FENCE')
+            if parent['delivery'] not in {'RETURNED', 'YIELDED', 'RECONCILED'} or db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('STARTED','DISPATCHING')", (parent['seat'],)).fetchone():
+                raise IntegrationError('LOCAL_REJECTION_WORK_NOT_SETTLED')
+            artifact = db.execute('SELECT body FROM c_artifact WHERE hash=?', (body_sha256,)).fetchone()
+            if row['hash'] != body_sha256 or not artifact or digest(artifact[0]) != body_sha256:
+                raise IntegrationError('LOCAL_REJECTION_BODY_MISMATCH')
+            try:
+                body = json.loads(artifact[0])
+                if encode(body).encode() != artifact[0] or set(body) != {'content', 'mentions'} or not isinstance(body['content'], str) or not isinstance(body['mentions'], list) or not body['mentions'] or not all(isinstance(m, str) and m.lstrip('@') for m in body['mentions']):
+                    raise ValueError()
+                events = {}
+                kinds = {'intent': 'SEND_INTENT', 'request': 'STDOUT_RPC', 'callback': 'CALLBACK_INTENT', 'unknown': 'DELIVERY_UNKNOWN', 'result': 'STDIN_RPC', 'completed': 'STDOUT_RPC'}
+                for name, ref in evidence_refs.items():
+                    if not isinstance(ref, dict) or set(ref) != {'seq', 'artifact_id'} or type(ref['seq']) is not int or not isinstance(ref['artifact_id'], str):
+                        raise ValueError()
+                    event = db.execute('SELECT * FROM c_event WHERE seq=?', (ref['seq'],)).fetchone()
+                    raw = db.execute('SELECT body FROM c_artifact WHERE hash=?', (ref['artifact_id'],)).fetchone()
+                    if not event or event['operation'] != operation or event['kind'] != kinds[name] or not raw or digest(raw[0]) != ref['artifact_id'] or raw[0] != event['body'].encode():
+                        raise ValueError()
+                    events[name] = json.loads(event['body'])
+                seq = {k: v['seq'] for k, v in evidence_refs.items()}
+                if not seq['request'] < seq['callback'] < seq['intent'] < seq['unknown'] < seq['result'] < seq['completed']:
+                    raise ValueError()
+                if events['intent'] != {'id': outbox_id, 'hash': body_sha256} or events['unknown'] != {'attempt': attempt, 'data': {'outbox_id': outbox_id}}:
+                    raise ValueError()
+                frames = {}
+                clients = set()
+                for name in ('request', 'result', 'completed'):
+                    event = events[name]
+                    if event['attempt'] != attempt:
+                        raise ValueError()
+                    clients.add(event['data']['client_id'])
+                    frames[name] = event['data']['payload']
+                if len(clients) != 1 or not next(iter(clients)):
+                    raise ValueError()
+                request, result, completed = (frames[n] for n in ('request', 'result', 'completed'))
+                params = request['params']
+                if request['method'] != 'item/tool/call' or params['tool'] != 'band_send_message' or params['arguments'] != body or request['id'] != result['id'] or not params['callId']:
+                    raise ValueError()
+                callback_hash = digest(encode({'method': request['method'], 'params': params}).encode())
+                cb = events['callback']
+                if cb != {'attempt': attempt, 'id': str(request['id']), 'hash': callback_hash}:
+                    raise ValueError()
+                callback = db.execute('SELECT hash FROM c_callback WHERE operation=? AND attempt=? AND id=?', (operation, attempt, str(request['id']))).fetchone()
+                if not callback or callback[0] != callback_hash:
+                    raise ValueError()
+                item = completed['params']['item']
+                if completed['method'] != 'item/completed' or item['type'] != 'dynamicToolCall' or item['tool'] != params['tool'] or item['id'] != params['callId'] or item['arguments'] != body or item['status'] != 'failed' or item['success'] is not False or completed['params']['threadId'] != params['threadId'] or completed['params']['turnId'] != params['turnId'] or params['threadId'] != parent['thread']:
+                    raise ValueError()
+                # Exact SDK error reconstruction. No loose HTTP/network ValueError match.
+                probe = sdk_agent.AgentTools(parent['room'], None, participants=[])
+                try:
+                    probe._resolve_required_mentions(body['mentions'])
+                except ValueError as exc:
+                    expected = {'success': False, 'contentItems': [{'type': 'inputText', 'text': 'Error: ' + str(exc)}]}
+                else:
+                    raise ValueError()
+                if result['result'] != expected or item['contentItems'] != expected['contentItems']:
+                    raise ValueError()
+                # A unique matching intent between this request and failed result
+                # is required; room absence and another operation's error are not proof.
+                intents = [json.loads(r[0]) for r in db.execute("SELECT body FROM c_event WHERE operation=? AND kind='SEND_INTENT' AND seq>? AND seq<?", (operation, seq['request'], seq['result']))]
+                if sum(i.get('hash') == body_sha256 for i in intents) != 1:
+                    raise ValueError()
+            except (ValueError, TypeError, KeyError, AttributeError):
+                raise IntegrationError('LOCAL_REJECTION_EVIDENCE_MISMATCH') from None
+            receipt = {'effect': 'NOT_SENT', 'code': 'LOCAL_SEND_VALIDATION_REJECTED', 'class': 'SDK4_EMPTY_CACHE_UNKNOWN_MENTION', 'attempt': attempt, 'body_sha256': body_sha256, 'sdk_sha256': pinned, 'evidence_refs': evidence_refs}
+            if row['state'] == 'REJECTED' and row['receipt'] == encode(receipt):
+                return {'id': outbox_id, 'state': 'REJECTED', **receipt}
+            if row['state'] != 'DELIVERY_UNKNOWN':
+                raise IntegrationError('LOCAL_REJECTION_STATE_CONFLICT')
+            db.execute("UPDATE c_outbox SET state='REJECTED',receipt=? WHERE id=? AND state='DELIVERY_UNKNOWN'", (encode(receipt), outbox_id))
+            Mailbox.event(db, operation, 'SEND_REJECTION_RECONCILED', {'id': outbox_id, **receipt})
+            return {'id': outbox_id, 'state': 'REJECTED', **receipt}
+
     def _parent(self, db, operation, attempt):
         scope = self.router._scope(db)
         cap = scope.get('continuation') if scope else None
@@ -32,7 +131,7 @@ class Recovery:
             raise IntegrationError('OWNER_ATTEMPT_FENCE')
         if parent['delivery'] not in {'RETURNED', 'YIELDED', 'RECONCILED'} or parent['state'] not in {'SUCCEEDED', 'FAILED', 'CANCELLED', 'PAUSED'} or not parent['thread']:
             raise IntegrationError('CONTINUATION_DELIVERY_UNKNOWN')
-        if db.execute("SELECT 1 FROM c_outbox o JOIN c_work w ON w.id=o.operation WHERE w.seat=? AND o.state!='ACKED'", (parent['seat'],)).fetchone() or db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN')", (parent['seat'],)).fetchone():
+        if db.execute("SELECT 1 FROM c_outbox o JOIN c_work w ON w.id=o.operation WHERE w.seat=? AND o.state NOT IN ('ACKED','REJECTED')", (parent['seat'],)).fetchone() or db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN')", (parent['seat'],)).fetchone():
             raise IntegrationError('CONTINUATION_OUTSTANDING_UNKNOWN')
         if db.execute("SELECT 1 FROM c_git_effect WHERE state!='ACKED'").fetchone():
             raise IntegrationError('CONTINUATION_GIT_UNKNOWN')

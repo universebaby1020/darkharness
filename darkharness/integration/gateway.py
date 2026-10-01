@@ -124,7 +124,7 @@ class IntegrationSession(Session):
         if action == "integration.status":
             with manager.owner.transaction(manager.owner.epoch) as db:
                 works = [dict(row) for row in db.execute("SELECT id,seat,room,attempt,state,delivery,thread FROM c_work")]
-                unknown = [dict(row) for row in db.execute("SELECT id,operation,state FROM c_outbox WHERE state!='ACKED'")]
+                unknown = [dict(row) for row in db.execute("SELECT id,operation,state FROM c_outbox WHERE state NOT IN ('ACKED','REJECTED')")]
             return self.response(req, data={"agent_count": len(manager.agents), "works": works, "unknown_outbox": unknown})
         if action == "integration.events":
             after = payload.get("after", 0)
@@ -158,6 +158,16 @@ class IntegrationSession(Session):
                 raise Rejected("SEAT_NOT_RUNNING")
             manager.mailbox.control(req["request_id"], req["operation_id"], payload["attempt"], "cancel", {"seat": payload["seat"]})
             return self.response(req, data={"job_id": service.submit(adapter.cancel_owned(req["operation_id"], payload["attempt"]))})
+        if action == 'integration.outbox.reject_local':
+            if set(payload) != {'attempt', 'grant_id', 'outbox_id', 'body_sha256', 'evidence_refs'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            recovery = service.recovery(req['operation_id'], payload['grant_id'])
+            result = recovery.reject_local_send(req['operation_id'], payload['attempt'], payload['outbox_id'], payload['body_sha256'], payload['evidence_refs'])
+            adapter = next((a for a in manager.adapters if a.alias == recovery.router.seat and not a.stopping), None)
+            if adapter is not None:
+                # Wake only already queued original work, not a new dispatch.
+                result['wake_job_id'] = service.submit(manager.wake_continuation(req['operation_id']))
+            return self.response(req, data=result)
         if action == 'integration.recovery.observe':
             if set(payload) != {'attempt', 'grant_id'}:
                 raise Rejected('INVALID_RECOVERY_PAYLOAD')

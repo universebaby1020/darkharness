@@ -17,6 +17,8 @@ from darkharness.integration.artifacts import SecretGuard
 
 HAS_SDK = find_spec("band") is not None
 if HAS_SDK:
+    from band.runtime.tools import AgentTools
+    from unittest.mock import AsyncMock, patch
     from band.adapters.codex import CodexAdapterConfig
     from band.core.types import PlatformMessage
     from band.integrations.codex.types import CodexSessionState
@@ -73,8 +75,10 @@ class Client:
         self.closed = True
 
 
-class Tools:
+class Tools(AgentTools if HAS_SDK else object):
     def __init__(self):
+        if HAS_SDK:
+            super().__init__('r', None, participants=[{'id': 'peer', 'handle': 'example-account/peer'}, {'id': 'coordinator-id', 'handle': 'example-account/coordinator'}])
         self.sent, self.events = [], []
 
     def get_openai_tool_schemas(self, **kwargs):
@@ -409,6 +413,129 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         reports = [content for content, typ, meta in self.tools.events if typ in {'tool_call', 'tool_result'}]
         self.assertTrue(any('dh_local_git_commit' in content for content in reports))
         self.assertTrue(any('COMMITTED' in content for content in reports))
+
+    async def test_real_sdk_local_rejections_before_intent_and_never_post(self):
+        from darkharness.integration.mailbox import digest, encode
+        op = self.box.receive('s', 'r', 'peer', 'preflight', 'task')['work']
+        self.box.claim(op, 'a')
+        raw = AgentTools('r', SimpleNamespace(), participants=[])
+        tools = GuardedTools(raw, self.adapter, op, 'a')
+        with patch('band.runtime.tools.agent.post_message', new_callable=AsyncMock) as post:
+            with self.assertRaises(ValueError):
+                await raw.send_message('reply', ['@example-account/missing'])
+            cases = [None, [], ['@example-account/missing'], [42], [{'handle': '@example-account/missing'}]]
+            for mentions in cases:
+                outcome = await tools.execute_tool_call_structured('band_send_message', {'content': 'reply', 'mentions': mentions})
+                self.assertFalse(outcome.ok)
+            post.assert_not_awaited()
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_event WHERE kind IN ('SEND_INTENT','DELIVERY_UNKNOWN')").fetchone()[0], 0)
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='REJECTED'").fetchone()[0], len(cases))
+        # A later cache correction cannot turn the same identifier into a send.
+        raw._participants = [{'id': 'fixed', 'handle': 'example-account/missing'}]
+        replay = GuardedTools(raw, self.adapter, op, 'a')
+        replay.counter = 2  # third original rejection: unknown handle
+        with self.assertRaisesRegex(IntegrationError, 'LOCAL_SEND_VALIDATION_REJECTED'):
+            await replay.send_message('reply', ['@example-account/missing'])
+
+    async def test_sdk_schema_blank_and_missing_content_are_local(self):
+        op = self.box.receive('s', 'r', 'peer', 'schema', 'task')['work']
+        self.box.claim(op, 'a')
+        tools = GuardedTools(self.tools, self.adapter, op, 'a')
+        for content in ('  ', 17):
+            outcome = await tools.execute_tool_call_structured('band_send_message', {'content': content, 'mentions': ['peer']})
+            self.assertFalse(outcome.ok)
+        outcome = await tools.execute_tool_call_structured('band_send_event', {'content': 'event', 'message_type': 'error', 'metadata': 17})
+        self.assertFalse(outcome.ok)
+        self.assertFalse(self.tools.sent)
+        self.assertFalse(self.tools.events)
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='DELIVERY_UNKNOWN'").fetchone()[0], 0)
+
+    async def test_real_network_valueerror_and_missing_ack_remain_unknown(self):
+        op = self.box.receive('s', 'r', 'peer', 'network', 'task')['work']
+        self.box.claim(op, 'a')
+        create = AsyncMock(side_effect=ValueError("Unknown participant 'example-account/missing'. Available handles: []"))
+        rest = SimpleNamespace(agent_api_messages=SimpleNamespace(create_agent_chat_message=create))
+        raw = AgentTools('r', rest, participants=[{'id': 'peer', 'handle': 'example-account/peer'}])
+        tools = GuardedTools(raw, self.adapter, op, 'a')
+        with self.assertRaises(ValueError):
+            await tools.send_message('reply', ['peer'])
+        create.assert_awaited_once()
+        self.assertEqual(self.owner.db.execute('SELECT state FROM c_outbox').fetchone()[0], 'DELIVERY_UNKNOWN')
+        create.side_effect = None
+        create.return_value = SimpleNamespace(data=None)
+        with self.assertRaises(RuntimeError):
+            await tools.send_message('reply 2', ['peer'])
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='DELIVERY_UNKNOWN'").fetchone()[0], 2)
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_event WHERE kind='SEND_REJECTED'").fetchone()[0], 0)
+
+    async def test_real_sdk_ack_replay_does_not_post_twice(self):
+        op = self.box.receive('s', 'r', 'peer', 'acked', 'task')['work']
+        self.box.claim(op, 'a')
+        create = AsyncMock(return_value=SimpleNamespace(data={'id': 'ack'}))
+        raw = AgentTools('r', SimpleNamespace(agent_api_messages=SimpleNamespace(create_agent_chat_message=create)), participants=[{'id': 'peer', 'handle': 'example-account/peer'}])
+        for _ in range(2):
+            self.assertEqual(await GuardedTools(raw, self.adapter, op, 'a').send_message('reply', ['peer']), {'id': 'ack'})
+        create.assert_awaited_once()
+
+    async def test_authoritative_bind_hydrates_self_peers_before_wake(self):
+        from band.runtime.execution import ExecutionContext
+        from darkharness.integration.launch import SeatManager
+        roster = [{'id': 'self', 'handle': 'example-account/self', 'name': 'self'}, {'id': 'peer', 'handle': 'example-account/peer', 'name': 'peer'}]
+        get = AsyncMock(return_value=SimpleNamespace(data=[SimpleNamespace(model_dump=lambda p=p: p) for p in roster]))
+        rest = SimpleNamespace(agent_api_participants=SimpleNamespace(list_agent_chat_participants=get), agent_api_events=SimpleNamespace(create_agent_chat_event=AsyncMock(return_value=SimpleNamespace(data={'id': 'event'}))), agent_api_messages=SimpleNamespace(create_agent_chat_message=AsyncMock(return_value=SimpleNamespace(data={'id': 'message'}))))
+        context = ExecutionContext('r', SimpleNamespace(rest=rest), None, agent_id='self')
+        agent = SimpleNamespace(_runtime=SimpleNamespace(runtime=SimpleNamespace(executions={'r': context})))
+        manager = SeatManager(self.owner, self.root)
+        manager.agents, manager.adapters = [agent], [self.adapter]
+        queued = self.box.receive('s', 'r', 'peer', 'bound-queue', 'original queued task')['work']
+        self.adapter.startup_binding_pending = True
+        self.adapter.raw_tools = AgentTools.from_context(context)
+        self.adapter._wake()
+        self.assertIsNone(self.adapter.worker)
+        # wake uses existing work to choose a seat; no replacement human event.
+        await asyncio.wait_for(manager.wake_continuation(queued), timeout=3)
+        await self.settle()
+        self.assertEqual([{k: p[k] for k in ('id', 'handle', 'name')} for p in self.adapter.raw_tools.participants], roster)
+        self.assertEqual(context.participants, self.adapter.raw_tools.participants)
+        get.assert_awaited_once()
+        self.assertEqual(AgentTools.from_context(context)._resolve_required_mentions(['@example-account/peer'])[0]['id'], 'peer')
+        self.assertEqual(self.client.turns, 1)
+        self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_inbox').fetchone()[0], 1)
+        self.assertEqual(self.box.read_work(queued)['delivery'], 'RETURNED')
+        get.return_value = SimpleNamespace(data=None)
+        with self.assertRaisesRegex(IntegrationError, 'PARTICIPANTS_NOT_READY'):
+            await asyncio.wait_for(manager.bind_room_tools(agent, self.adapter), timeout=3)
+
+    async def test_queued_original_work_drains_after_proven_rejection(self):
+        from test_integration_gateway import local_rejection_trace
+        from darkharness.integration.recovery import Recovery
+        parent = self.box.receive('s', 'r', 'peer', 'old-task', 'old original task')['work']
+        self.box.claim(parent, 'old-attempt')
+        self.box.update(parent, 'old-attempt', state='SUCCEEDED', delivery='RETURNED', thread='session')
+        args = local_rejection_trace(self.box, parent, 'old-attempt')
+        self.owner.grant(self.root, continuation={'operations': [parent]})
+        await self.deliver(self.message('queued', 'original queued coordinator work'))
+        await self.settle()
+        self.assertEqual(self.client.turns, 0)
+        result = Recovery(self.box, self.router, self.adapter.git_broker).reject_local_send(parent, **args)
+        self.assertEqual(result['effect'], 'NOT_SENT')
+        from band.runtime.execution import ExecutionContext
+        from darkharness.integration.launch import SeatManager
+        roster = [{'id': 'self', 'handle': 'example-account/self'}, {'id': 'peer', 'handle': 'example-account/peer'}]
+        rest = SimpleNamespace(agent_api_participants=SimpleNamespace(list_agent_chat_participants=AsyncMock(return_value=SimpleNamespace(data=[SimpleNamespace(model_dump=lambda p=p: p) for p in roster]))), agent_api_events=SimpleNamespace(create_agent_chat_event=AsyncMock(return_value=SimpleNamespace(data={'id': 'event'}))), agent_api_messages=SimpleNamespace(create_agent_chat_message=AsyncMock(return_value=SimpleNamespace(data={'id': 'message'}))))
+        context = ExecutionContext('r', SimpleNamespace(rest=rest), None, agent_id='self')
+        agent = SimpleNamespace(_runtime=SimpleNamespace(runtime=SimpleNamespace(executions={'r': context})))
+        manager = SeatManager(self.owner, self.root)
+        manager.agents, manager.adapters = [agent], [self.adapter]
+        await asyncio.wait_for(manager.wake_continuation(parent), timeout=3)
+        await self.settle()
+        self.assertIsInstance(self.adapter.raw_tools, AgentTools)
+        self.assertEqual(self.client.turns, 1)
+        self.assertIn('original queued coordinator work', str([p for m, p in self.client.requests if m == 'turn/start'][0]['input']))
+        self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_inbox').fetchone()[0], 2)
+        self.assertEqual(self.box.read_work(parent)['state'], 'SUCCEEDED')
+        with self.assertRaisesRegex(IntegrationError, 'LOCAL_SEND_VALIDATION_REJECTED'):
+            self.box.prepare_send(args['outbox_id'], parent, {'content': 'original reply', 'mentions': ['@example-account/dh-builder']})
 
     async def test_stale_cancel_does_not_touch_other_attempt(self):
         await self.deliver(self.message())

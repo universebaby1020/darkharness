@@ -31,6 +31,33 @@ from .contract import PermissionRequest, RuntimeBinding, RuntimeEvent
 from .mailbox import HandoffPart, IntegrationError, digest, encode
 
 
+class LocalSendRejected(IntegrationError):
+    """Pure preflight rejection; no external boundary has been crossed."""
+
+
+def validate_local_send(raw, method, body):
+    # Pinned SDK4 resolver and Fern models, not string-based exception inference.
+    from band.runtime.tools.agent import AgentTools
+    from band.client.rest import ChatMessageRequest, ChatMessageRequestMentionsItem, ChatEventRequest
+    from band.core.content import has_visible_content
+    from band.core.exceptions import BandToolError
+    from pydantic import ValidationError
+    try:
+        if method == 'send_message':
+            mentions = body['mentions']
+            if mentions is not None and (not isinstance(mentions, list) or any(not isinstance(m, (str, dict)) for m in mentions)):
+                raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
+            # This private seam is pinned to SDK4. It is synchronous and pure.
+            resolved = AgentTools._resolve_required_mentions(raw, mentions)
+            ChatMessageRequest(content=body['content'], mentions=[ChatMessageRequestMentionsItem(**m) for m in resolved])
+        elif method == 'send_event':
+            ChatEventRequest(**body)
+        if not has_visible_content(body['content']):
+            raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
+    except (ValueError, TypeError, AttributeError, BandToolError, ValidationError):
+        raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED') from None
+
+
 class PeerYield(BaseException):
     """Internal control signal: intentionally bypasses SDK generic-error fallback."""
 
@@ -178,6 +205,14 @@ class GuardedTools:
             raise IntegrationError("GRANT_INACTIVE")
         self.counter += 1
         identifier = digest(encode([self.operation, self.attempt, self.call_id or "adapter", method, self.counter]).encode())
+        old = self.adapter.mailbox.send_readback(identifier, self.operation, body)
+        if old is not None:
+            return old
+        try:
+            validate_local_send(self.raw, method, body)
+        except LocalSendRejected as exc:
+            self.adapter.mailbox.reject_send(identifier, self.operation, self.attempt, body, str(exc))
+            raise
         old = self.adapter.mailbox.prepare_send(identifier, self.operation, body)
         if old is not None:
             return old
@@ -208,6 +243,11 @@ class GuardedTools:
 
     async def execute_tool_call_structured(self, name, arguments):
         try:
+            if name in {'band_send_message', 'band_send_event'}:
+                allowed = {'content', 'mentions'} if name == 'band_send_message' else {'content', 'message_type', 'metadata'}
+                required = {'content'} if name == 'band_send_message' else {'content', 'message_type'}
+                if not isinstance(arguments, dict) or not required <= arguments.keys() or not arguments.keys() <= allowed:
+                    raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
             if name in GIT_TOOLS:
                 self.adapter.guard.require_clean(arguments)
                 required = GIT_TOOLS[name]['inputSchema']['required']
@@ -261,6 +301,7 @@ class DurableCodexAdapter(CodexAdapter):
         self.current = ContextVar("dh_current", default=None)
         self.worker = None
         self.raw_tools = None
+        self.startup_binding_pending = False
         self.history = CodexSessionState()
         self._turn_identity = None
         self._yielded = False
@@ -312,6 +353,7 @@ class DurableCodexAdapter(CodexAdapter):
             if not sep:
                 raise IntegrationError("PEER_ANSWER_INCOMPLETE")
             self.mailbox.answer(qid, msg.sender_id, answer)
+            await self._hydrate_startup_tools(tools)
             self._wake()
             return
         part = None
@@ -327,11 +369,21 @@ class DurableCodexAdapter(CodexAdapter):
             except (KeyError, TypeError):
                 raise IntegrationError("HANDOFF_SHAPE_INVALID") from None
         self.mailbox.receive(self.alias, room_id, msg.sender_id, msg.id, content, envelope=envelope, part=part)
+        await self._hydrate_startup_tools(tools)
         self._wake()
         # No await of the model turn or peer reply on the Band room dispatch lane.
 
+    async def _hydrate_startup_tools(self, tools):
+        # A message may race maintenance startup's explicit room bind. Its
+        # receipt is already durable; never start queued work on an empty cache.
+        if self.startup_binding_pending:
+            from .launch import hydrate_room_tools
+            await hydrate_room_tools(tools, getattr(tools, '_ctx', None))
+            self.raw_tools = tools
+            self.startup_binding_pending = False
+
     def _wake(self):
-        if not self.stopping and self.raw_tools is not None and (self.worker is None or self.worker.done()):
+        if not self.stopping and not self.startup_binding_pending and self.raw_tools is not None and (self.worker is None or self.worker.done()):
             self.worker = asyncio.create_task(self._drain())
 
     async def _drain(self):

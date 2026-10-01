@@ -80,6 +80,15 @@ def prepare(config, official_root, python="python3"):
             "unchecked_gates": ["room teamwork", "stage execution", "post-contest gate4 review"]}
 
 
+async def hydrate_room_tools(tools, context):
+    if context is None:
+        raise IntegrationError('ROOM_CONTEXT_NOT_READY')
+    roster = await tools.get_participants()  # SDK syncs context and authoritative cache.
+    ids = {p.get('id') for p in tools.participants}
+    if not roster or None in ids or len(ids) != len(roster) or context.agent_id not in ids or ids != {p.get('id') for p in context.participants}:
+        raise IntegrationError('ROOM_PARTICIPANTS_NOT_READY')
+
+
 class SeatManager:
     def __init__(self, owner, official_root, python="python3"):
         self.owner, self.official_root, self.python = owner, official_root, python
@@ -138,6 +147,7 @@ class SeatManager:
                 adapter = DurableCodexAdapter(mailbox=self.mailbox, router=router, guard=guard,
                      alias=seat["alias"], display_name=actor, room_id=config["room_id"],
                      workspace=config["workspace"], coordinator_id=coordinator, config=sdk_config)
+                adapter.startup_binding_pending = True
                 binding = RuntimeBinding("codex", "0.159.3", config["workspace"], "workspace-write", "on-request",
                       "native-controlled", ("same-UID credential access possible", "Docker/interop not an isolation boundary", "privileged shell wrappers denied", "SDK platform ACK is not exactly-once"),
                       sdk_config.turn_timeout_s, digest(text.encode()))
@@ -151,7 +161,7 @@ class SeatManager:
                 await agent.start()
             ready = [await runtime.readiness() for runtime in self.runtimes]
             for agent, adapter in zip(self.agents, self.adapters):
-                if self.bind_room_tools(agent, adapter):
+                if await self.bind_room_tools(agent, adapter):
                     adapter._wake()
             with self.owner.transaction(self.owner.epoch) as db:
                 Mailbox.event(db, None, "RUNTIME_BINDINGS", {"run_id": config["run_id"], "bindings": bindings, "readiness": ready})
@@ -160,21 +170,24 @@ class SeatManager:
             await self.stop()
             raise
 
-    def bind_room_tools(self, agent, adapter):
+    async def bind_room_tools(self, agent, adapter):
         # Pinned SDK4 room execution supplies real platform tools. Do not invent
         # a MessageEvent/new human dispatch merely to recreate a cleared job.
         from band.runtime.tools import AgentTools
         context = agent._runtime.runtime.executions.get(adapter.allowed_room)
         if context is None:
             return False
-        adapter.raw_tools = AgentTools.from_context(context)
+        tools = AgentTools.from_context(context)
+        await hydrate_room_tools(tools, context)
+        adapter.raw_tools = tools
+        adapter.startup_binding_pending = False
         return True
 
     async def wake_continuation(self, operation):
         work = self.mailbox.read_work(operation)
         for agent, adapter in zip(self.agents, self.adapters):
             if adapter.alias == work['seat'] and not adapter.stopping:
-                if not self.bind_room_tools(agent, adapter):
+                if not await self.bind_room_tools(agent, adapter):
                     raise IntegrationError('ROOM_CONTEXT_NOT_READY')
                 adapter._wake()
                 return {'continuation': operation, 'wake': 'AUTHORIZED_QUEUE_DRAIN'}

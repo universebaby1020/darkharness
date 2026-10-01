@@ -197,17 +197,40 @@ class Mailbox:
                 self.event(db, row[0], "DELIVERY_UNKNOWN", {"attempt": row[1], "cause": "owner_restart"})
             return [r[0] for r in rows]
 
+    @staticmethod
+    def _send_readback(row, operation, h):
+        if row['hash'] != h or row['operation'] != operation:
+            raise IntegrationError('OUTBOX_ID_CONFLICT')
+        if row['state'] == 'REJECTED':
+            raise IntegrationError('LOCAL_SEND_VALIDATION_REJECTED')
+        if row['state'] != 'ACKED':
+            raise IntegrationError('DELIVERY_UNKNOWN_FENCE')
+        return json.loads(row['receipt'])
+
+    def send_readback(self, identifier, operation, body):
+        with self.owner.transaction(self.owner.epoch) as db:
+            row = db.execute('SELECT * FROM c_outbox WHERE id=?', (identifier,)).fetchone()
+            return self._send_readback(row, operation, digest(encode(body).encode())) if row else None
+
+    def reject_send(self, identifier, operation, attempt, body, code):
+        # Only called by the synchronous local validation phase, never an HTTP catch.
+        raw = encode(body).encode()
+        with self.owner.transaction(self.owner.epoch) as db:
+            row = db.execute('SELECT * FROM c_outbox WHERE id=?', (identifier,)).fetchone()
+            if row:
+                return self._send_readback(row, operation, digest(raw))
+            h = self.artifact(db, raw)
+            receipt = {'effect': 'NOT_SENT', 'code': code, 'phase': 'SDK4_LOCAL_PREFLIGHT', 'attempt': attempt}
+            db.execute("INSERT INTO c_outbox VALUES(?,?,?,'REJECTED',?)", (identifier, operation, h, encode(receipt)))
+            self.event(db, operation, 'SEND_REJECTED', {'id': identifier, 'hash': h, **receipt})
+
     def prepare_send(self, identifier, operation, body):
         raw = encode(body).encode()
         with self.owner.transaction(self.owner.epoch) as db:
             h = digest(raw)
             row = db.execute("SELECT * FROM c_outbox WHERE id=?", (identifier,)).fetchone()
             if row:
-                if row["hash"] != h or row["operation"] != operation:
-                    raise IntegrationError("OUTBOX_ID_CONFLICT")
-                if row["state"] != "ACKED":
-                    raise IntegrationError("DELIVERY_UNKNOWN_FENCE")
-                return json.loads(row["receipt"])
+                return self._send_readback(row, operation, h)
             self.artifact(db, raw)
             # Before crossing the external boundary, uncertainty is durable.
             db.execute("INSERT INTO c_outbox VALUES(?,?,?,'DELIVERY_UNKNOWN',NULL)", (identifier, operation, h))
@@ -216,9 +239,11 @@ class Mailbox:
 
     def sent(self, identifier, receipt):
         with self.owner.transaction(self.owner.epoch) as db:
-            row = db.execute("SELECT operation FROM c_outbox WHERE id=?", (identifier,)).fetchone()
+            row = db.execute("SELECT operation,state FROM c_outbox WHERE id=?", (identifier,)).fetchone()
             if not row:
                 raise IntegrationError("OUTBOX_NOT_FOUND")
+            if row['state'] == 'REJECTED':
+                raise IntegrationError('LOCAL_SEND_VALIDATION_REJECTED')
             db.execute("UPDATE c_outbox SET state='ACKED',receipt=? WHERE id=?", (encode(receipt), identifier))
             self.event(db, row[0], "SEND_ACK", {"id": identifier, "receipt": receipt})
 
