@@ -11,9 +11,10 @@ ledger, epoch/attempt fencing, monotonic terminal states, atomic intent/event
 records, framed IPC, paged artifacts, separate scoped seat channel, control
 records and a live foreground recovery-subject binding.
 
-Not implemented by this foundation: provider dispatch, automatic pending-effect
-replay, durable runtime recovery, GUI/installer, full approval enforcement of
-native shell tools. A foreground session is maintained until explicit shutdown
+The optional Band integration adds SDK Codex dispatch, durable inbox/outbox,
+complete handoff assembly, scoped permission routing and peer continuations.
+Automatic recovery of uncertain external effects, GUI/installer and full approval
+enforcement of native shell tools remain incomplete. A foreground session is maintained until explicit shutdown
 or transport EOF; seat/room idleness does not stop it.
 
 ## Run from source
@@ -81,3 +82,34 @@ The guard is prevention, not proof that arbitrary secrets cannot escape.
 See [the W1 API and boundaries](docs/w1-api.md). Installation packaging is
 present but installed-entry qualification is NOT_RUN. The implementation does
 not copy EUNHArness code or include track specifications/answers.
+
+## Optional Band SDK integration
+
+Use a Linux virtual environment and install the pinned optional dependency:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install '.[band]'
+```
+
+The integration uses Band SDK 4.0.0 and an independently authenticated Codex CLI.
+Keep agent credentials, run configuration and state outside this repository.
+Configure model and effort per run; role names do not select a model or grant
+authority. The first development runtime is Codex, behind a provider-independent
+contract.
+
+Read [the SDK support matrix and launch sequence](docs/sdk-support.md) before
+starting seats. Component tests exercise the real SDK with synthetic RPC clients;
+they do not establish live Band teamwork, unattended completion or contest
+qualification. The controller retains UNKNOWN fences instead of replaying
+unconfirmed effects.
+
+For the component suite, set `DH_OFFICIAL_ROOT` to an external, trusted official
+checker checkout and run the tests inside the SDK virtual environment:
+
+```sh
+python -B -m unittest discover -s tests -v
+```
+
+Third-party credential-pattern attribution is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

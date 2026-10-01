@@ -9,5 +9,8 @@ description = "Linux execution foundation and explicit Windows Host Bridge"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+band = ["band-sdk[codex]==4.0.0"]
+
 [tool.setuptools.packages.find]
 include = ["darkharness*"]

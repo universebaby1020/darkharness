@@ -1,0 +1,15 @@
+{
+  "run_id": "replace-with-run-identity",
+  "room_id": "replace-with-actual-custom-room-id",
+  "workspace": "/srv/dh-runs/rehearsal/result",
+  "credentials_path": "/srv/dh-private/agents.json",
+  "grant_id": "controller-recorded-rehearsal-grant",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "codex_command": ["codex", "app-server", "--listen", "stdio://"],
+  "seats": [
+    {"alias": "dh-coordinator", "display_name": "dh coordinator", "role": "coordinator", "participant_id": "replace-coordinator-id"},
+    {"alias": "dh-builder", "display_name": "dh builder", "role": "builder", "participant_id": "replace-builder-id"},
+    {"alias": "dh-reviewer", "display_name": "dh reviewer", "role": "reviewer", "participant_id": "replace-reviewer-id"}
+  ]
+}
