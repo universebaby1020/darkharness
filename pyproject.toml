@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "darkharness"
+version = "0.1.0"
+description = "Linux execution foundation and explicit Windows Host Bridge"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+[tool.setuptools.packages.find]
+include = ["darkharness*"]

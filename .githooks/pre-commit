@@ -1,0 +1,3 @@
+#!/bin/sh
+# Repository-local hook. Scan the whole index, not only changed lines.
+exec python -B tools/public_guard.py
