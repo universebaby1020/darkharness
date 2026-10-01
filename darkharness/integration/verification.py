@@ -24,6 +24,15 @@ import subprocess
 import threading
 import time
 import uuid
+from types import MappingProxyType
+
+
+def _immutable(value):
+    if isinstance(value, dict):
+        return MappingProxyType({k: _immutable(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable(v) for v in value)
+    return value
 
 from .mailbox import IntegrationError, Mailbox, digest, encode
 
@@ -496,7 +505,11 @@ class VerificationBroker:
             if code is not None and state not in {'CANCELLED', 'TIMED_OUT'}:
                 for name in cfg['report_files']:
                     artifacts[name] = _hash_file(output / name)
-                accepted = self.parsers[cfg['report_contract']](output, code)
+                parser = self.parsers[cfg['report_contract']]
+                if hasattr(parser, 'parse_request'):
+                    accepted = parser.parse_request(output, code, _immutable({'request': request, 'config': cfg}))
+                else:
+                    accepted = parser(output, code)  # legacy trusted two-argument parser
                 if type(accepted) is not bool:
                     raise IntegrationError('REPORT_CONTRACT_UNKNOWN')
                 if code == 0 and reason != 'EXPLICIT_CONTROLLER_LOG_LIMIT':

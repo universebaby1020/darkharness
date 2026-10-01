@@ -27,6 +27,9 @@ from band.runtime.tools.schema import ToolCallOutcome, serialize_tool_result
 
 from .artifacts import git_evidence, slug
 from .git_broker import LocalGitBroker
+from .verification import VerificationBroker
+from .verification_bridge import VerificationBridge, VerificationYield
+from .thread_ownership import ThreadOwnership
 from .contract import PermissionRequest, RuntimeBinding, RuntimeEvent
 from .mailbox import HandoffPart, IntegrationError, digest, encode
 
@@ -197,7 +200,7 @@ class GuardedTools:
 
     def get_openai_tool_schemas(self, **kwargs):
         schemas = self.raw.get_openai_tool_schemas(**kwargs)
-        return [s for s in schemas if (s.get("function", {}).get("name") or s.get("name")) in READ_TOOLS | SEND_TOOLS] + [{'name': name, **schema} for name, schema in GIT_TOOLS.items()]
+        return [s for s in schemas if (s.get("function", {}).get("name") or s.get("name")) in READ_TOOLS | SEND_TOOLS] + [{'name': name, **schema} for name, schema in GIT_TOOLS.items()] + self.adapter.verification.schemas()
 
     async def _send(self, method, body):
         self.adapter.guard.require_clean(body)
@@ -255,12 +258,27 @@ class GuardedTools:
                     raise IntegrationError('TYPED_GIT_ARGUMENTS_REQUIRED')
                 identifier = digest(encode([self.operation, self.attempt, self.call_id, name]).encode())
                 method = self.adapter.git_broker.commit if name == 'dh_local_git_commit' else self.adapter.git_broker.snapshot
+                with self.adapter.mailbox.owner.transaction(self.adapter.mailbox.owner.epoch) as db:
+                    old_ack = db.execute("SELECT 1 FROM c_git_effect WHERE id=? AND state='ACKED'", (identifier,)).fetchone()
                 try:
                     result = method(self.operation, self.attempt, identifier, **arguments)
                 except (OSError, ValueError, TypeError):
                     raise IntegrationError('LOCAL_GIT_DIAGNOSTIC_REDACTED') from None
+                # Stamp the actual creating seat; canonical receipt/hash is unchanged.
+                if not old_ack:
+                    VerificationBroker.record_git_origin(self.adapter.mailbox, self.adapter.router, identifier)
+                # An ACK replay is not a creating call. Never backfill a legacy
+                # run from today's Grant; legacy provenance requires Main ledger.
                 self.adapter.guard.require_clean(result)
                 self.adapter.mailbox.observe(self.operation, self.attempt, 'LOCAL_GIT_TOOL_RESULT', {'name': name, 'call_id': self.call_id, 'receipt': result})
+            elif name == 'dh_verify':
+                effect, result = await self.adapter.verification.start(self.operation, self.attempt, self.call_id, arguments)
+                self.adapter._verification_effect = effect
+            elif name == 'dh_verification_read':
+                self.adapter.guard.require_clean(arguments)
+                if not isinstance(arguments, dict) or set(arguments) != {'effect_id', 'artifact', 'offset', 'limit'}:
+                    raise IntegrationError('TYPED_VERIFICATION_ARGUMENTS_REQUIRED')
+                result = await asyncio.to_thread(self.adapter.verification.read_page, self.operation, self.attempt, **arguments)
             elif name == "band_send_message":
                 result = await self.send_message(**arguments)
             elif name == "band_send_event":
@@ -284,7 +302,7 @@ class GuardedTools:
 
 class DurableCodexAdapter(CodexAdapter):
     def __init__(self, *, mailbox, router, guard, alias, display_name, room_id, workspace,
-                 coordinator_id, config, event_sink=None):
+                 coordinator_id, config, event_sink=None, report_parsers=None, receipt_run_resolver=None):
         if version("band-sdk") != "4.0.0":
             raise IntegrationError("SDK_VERSION_UNSUPPORTED")
         if config.cwd is not None or config.approval_policy != "on-request" or config.sandbox != "workspace-write" or config.sandbox_policy is not None or config.enable_self_config_tools:
@@ -294,6 +312,10 @@ class DurableCodexAdapter(CodexAdapter):
         super().__init__(config=config)
         self.mailbox, self.router, self.guard = mailbox, router, guard
         self.git_broker = LocalGitBroker(mailbox, router, display_name, slug(display_name) + '@actors.invalid', workspace)
+        self.verification = VerificationBridge(mailbox, router, guard, report_parsers=report_parsers, receipt_run_resolver=receipt_run_resolver)
+        self.thread_ownership = ThreadOwnership(mailbox, router)
+        self._verification_effect = None
+        self._cutover_history = None
         self.alias, self.display_name = alias, display_name
         self.allowed_room, self.workspace = room_id, str(Path(workspace).resolve())
         self.coordinator_id = coordinator_id  # Actual participant ID, not alias/slug.
@@ -396,9 +418,8 @@ class DurableCodexAdapter(CodexAdapter):
             token = self.current.set((work["id"], attempt))
             self._active_room.set(self.allowed_room)
             room_state = self._room_client(self.allowed_room)
-            # Thread choice belongs to this durable WorkItem, never a cached
-            # thread left by a different queued operation on the same seat.
-            self._room_threads.pop(self.allowed_room, None)
+            # Never select a sender-unfiltered per-message SDK thread.
+            # Latest verified own thread is durable across native client retirement.
             if room_state.client is not None and hasattr(room_state.client, 'evidence'):
                 room_state.client.evidence.bind((work['id'], attempt))
             self._yielded = False
@@ -410,8 +431,11 @@ class DurableCodexAdapter(CodexAdapter):
                   message_type="text", metadata=envelope.get("metadata", {}),
                   created_at=datetime.fromisoformat(envelope.get("created_at", datetime.now(timezone.utc).isoformat())))
             tools = GuardedTools(self.raw_tools, self, work["id"], attempt)
-            thread = work["thread"] or envelope.get("session_thread")
-            history = CodexSessionState(thread_id=thread, room_id=self.allowed_room) if thread else self.history
+            owned = self.thread_ownership.latest(work['thread'])
+            thread = owned['thread'] if owned else None
+            history = CodexSessionState(thread_id=thread, room_id=self.allowed_room)
+            self._verification_effect = None
+            self._cutover_history = None
             try:
                 # Call actual SDK turn runner. Slash commands deliberately disabled:
                 # seat messages cannot change sandbox/model/grants or resolve asks.
@@ -425,6 +449,23 @@ class DurableCodexAdapter(CodexAdapter):
                 # Runtime turn completed is NOT parent WorkItem acceptance.
                 state = {"completed": "SUCCEEDED", "interrupted": "CANCELLED"}.get(outcome, "FAILED")
                 self.mailbox.update(work["id"], attempt, state=state, delivery="RETURNED", result={"runtime_status": outcome, "git": evidence, "acceptance": "NOT_EVALUATED"})
+            except VerificationYield as yielded:
+                # Model turn is gone; the work remains RUNNING/STARTED while
+                # the owned trusted checker runs outside SDK's turn timeout.
+                await self._retire_owned_client()
+                self._record('VERIFICATION_WAIT', {'effect': yielded.effect_id, 'sdk_turn_timeout_seconds': self.config.turn_timeout_s, 'checker_wait': 'OWNED_ASYNC_NO_DEFAULT_BUDGET'})
+                try:
+                    await self.verification.broker.wait(work['id'], attempt, yielded.effect_id)
+                    child = self.verification.complete(work['id'], attempt, yielded.effect_id)
+                    if child is None:
+                        self.mailbox.update(work['id'], attempt, state='PAUSED', delivery='DELIVERY_UNKNOWN', result={'verification_effect': yielded.effect_id, 'replay': 'FENCED'})
+                except asyncio.CancelledError:
+                    self.mailbox.update(work['id'], attempt, state='PAUSED', delivery='DELIVERY_UNKNOWN')
+                    raise
+                except BaseException as exc:
+                    self.mailbox.update(work['id'], attempt, state='PAUSED', delivery='DELIVERY_UNKNOWN', result={'verification_effect': yielded.effect_id, 'replay': 'FENCED'})
+                    self._record('VERIFICATION_COMPLETION_UNKNOWN', {'effect': yielded.effect_id, 'code': type(exc).__name__})
+                    return
             except PeerYield:
                 self._record("TURN_YIELDED", {"peer": self.coordinator_id})
             except asyncio.CancelledError:
@@ -453,26 +494,51 @@ class DurableCodexAdapter(CodexAdapter):
             self._room_threads.pop(self.allowed_room, None)
 
     async def _ensure_thread(self, *, room_id, history, tools, is_session_bootstrap):
-        # SDK4 cannot refresh dynamicTools on thread/resume. Reuse a thread only
-        # when its durable source/mandate/tool fingerprint matches; otherwise
-        # start a native thread with explicit, evidenced old-thread lineage.
-        sources = {name: digest((Path(__file__).parent / name).read_bytes()) for name in ('codex.py', 'git_broker.py', 'recovery.py')}
-        fingerprint = digest(encode({'tools': self._build_dynamic_tools(tools), 'mandate': digest(self.config.system_prompt.encode()), 'sources': sources}).encode())
-        old_thread = self._room_threads.get(room_id) or history.thread_id
-        cutover = False
-        if old_thread:
-            with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
-                registered = db.execute('SELECT fingerprint FROM c_thread_tools WHERE thread=?', (old_thread,)).fetchone()
-            cutover = registered is None or registered[0] != fingerprint
+        # Implementation revision is provenance, not native schema compatibility.
+        sources = {name: digest((Path(__file__).parent / name).read_bytes()) for name in ('codex.py', 'git_broker.py', 'recovery.py', 'verification.py', 'verification_bridge.py', 'thread_ownership.py')}
+        prompt_hash = digest(self.config.system_prompt.encode())
+        fingerprint = digest(encode({'tools': self._build_dynamic_tools(tools), 'mandate': prompt_hash}).encode())
+        owned = self.thread_ownership.latest(history.thread_id)
+        old_thread = owned['thread'] if owned else None
+        cutover = bool(owned and owned['compatibility'] != fingerprint)
+        self._room_threads.pop(room_id, None)
+        # Every new transport explicitly resumes our own verified latest thread.
+        # No ThreadResume.history hack and no sender-unfiltered SDK history.
+        history = CodexSessionState(thread_id=old_thread if not cutover else None, room_id=room_id)
         if cutover:
-            self._room_threads.pop(room_id, None)
-            self._record('THREAD_TOOLSET_CUTOVER_INTENT', {'old_thread': old_thread, 'fingerprint': fingerprint, 'reason': 'SDK4_resume_cannot_refresh_dynamicTools'})
-            history = CodexSessionState(room_id=room_id)
-        thread = await super()._ensure_thread(room_id=room_id, history=history, tools=tools, is_session_bootstrap=is_session_bootstrap)
+            prior = await self._client.request('thread/read', {'threadId': old_thread, 'includeTurns': True}, retry_on_overload=False)
+            self.guard.require_clean(self.guard.sanitize(prior))
+            self._cutover_history = self.thread_ownership.history(self.current.get()[0], self.guard.sanitize(prior))
+            self._record('THREAD_TOOLSET_CUTOVER_INTENT', {'old_thread': old_thread, 'fingerprint': fingerprint, 'history_ref': self._cutover_history[1], 'reason': 'SDK4_resume_cannot_refresh_dynamicTools'})
+        elif owned is None:
+            # Necessary migration/cutover from unverified legacy metadata: keep
+            # original durable own tasks without claiming legacy thread ownership.
+            self._cutover_history = self.thread_ownership.history(self.current.get()[0])
+        # Room-scoped SDK prompt cache must never suppress a fresh thread mandate.
+        self._prompt_injected_rooms.discard(room_id)
+        if owned and not cutover and owned['prompt_hash'] == prompt_hash:
+            self._prompt_injected_rooms.add(room_id)
+        thread = await super()._ensure_thread(room_id=room_id, history=history, tools=tools, is_session_bootstrap=True)
+        if thread != old_thread or cutover:
+            self._prompt_injected_rooms.discard(room_id)
+            if owned and not cutover:
+                # Resume fallback is a new thread; preserve owned prior history.
+                prior = await self._client.request('thread/read', {'threadId': old_thread, 'includeTurns': True}, retry_on_overload=False)
+                self._cutover_history = self.thread_ownership.history(self.current.get()[0], self.guard.sanitize(prior))
+        self.thread_ownership.bind(thread, fingerprint)
         with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
             db.execute('INSERT OR REPLACE INTO c_thread_tools VALUES(?,?)', (thread, fingerprint))
-        self._record('THREAD_TOOLSET_BOUND', {'thread': thread, 'old_thread': old_thread if cutover else None, 'fingerprint': fingerprint, 'cutover': cutover})
+        self._record('THREAD_TOOLSET_BOUND', {'thread': thread, 'old_thread': old_thread, 'fingerprint': fingerprint, 'cutover': cutover, 'sources': sources})
         return thread
+
+    def _build_turn_input(self, *, msg, participants_msg, contacts_msg, room_id):
+        if self._cutover_history is not None:
+            body, ref = self._cutover_history
+            msg = replace(msg, content=encode({'current_message': msg.content, 'owned_prior_context': body, 'history_ref': ref}))
+        # SDK raw room history is neither owned nor authenticated. Never inject it.
+        self._needs_history_injection.discard(room_id)
+        self._raw_history_by_room.pop(room_id, None)
+        return super()._build_turn_input(msg=msg, participants_msg=participants_msg, contacts_msg=contacts_msg, room_id=room_id)
 
     async def _start_turn(self, params):
         if not self.router.active():
@@ -484,6 +550,9 @@ class DurableCodexAdapter(CodexAdapter):
         self._turn_identity = (params["threadId"], turn["id"])
         operation, attempt = self.current.get()
         self.mailbox.update(operation, attempt, delivery="STARTED", thread=params["threadId"])
+        if any(item.get('text') == '[System Instructions]\n' + self.config.system_prompt for item in params.get('input', [])):
+            self.thread_ownership.prompted(params['threadId'], digest(self.config.system_prompt.encode()))
+            self._record('THREAD_MANDATE_INJECTED', {'thread': params['threadId'], 'prompt_hash': digest(self.config.system_prompt.encode())})
         self._record("TURN_ACCEPTED", {"session": params["threadId"], "turn": turn["id"], "cwd": self.workspace})
         return result
 
@@ -564,7 +633,17 @@ class DurableCodexAdapter(CodexAdapter):
             raise PeerYield()
         if isinstance(tools, GuardedTools):
             tools.call_id = str(params.get("callId") or event.id)
-        return await super()._handle_server_request(tools=tools, msg=msg, room_id=room_id, event=event)
+        self._verification_effect = None
+        settled = await super()._handle_server_request(tools=tools, msg=msg, room_id=room_id, event=event)
+        if self._verification_effect is not None:
+            # SDK has authenticated/responded to the native tool callback once.
+            # Retire the model turn without awaiting checker runtime in SDK180s.
+            effect = self._verification_effect
+            if self._turn_identity:
+                await self._client.request('turn/interrupt', {'threadId': self._turn_identity[0], 'turnId': self._turn_identity[1]}, retry_on_overload=False)
+            self._record('VERIFICATION_YIELD', {'effect': effect})
+            raise VerificationYield(effect)
+        return settled
 
     async def cancel_owned(self, operation, attempt):
         work = self.mailbox.read_work(operation)
@@ -581,9 +660,11 @@ class DurableCodexAdapter(CodexAdapter):
             await state.client.close()
             state.client = None
             state.initialized = False
-        self.mailbox.update(operation, attempt, state="CANCELLED", delivery="RETURNED", result={"termination": "OWNED_GROUP_STOPPED"})
+        # Native group stop is not proof of external Docker cleanup. The
+        # trusted checker owns cleanup; its final evidence remains separately stored.
+        self.mailbox.update(operation, attempt, state="CANCELLED", delivery="RETURNED", result={"termination": "OWNED_GROUP_STOPPED", "checker_external_cleanup": "NOT_PROVEN"})
         self.mailbox.drain_controls(operation, attempt)
-        return {"termination": "OWNED_GROUP_STOPPED"}
+        return {"termination": "OWNED_GROUP_STOPPED", "checker_external_cleanup": "NOT_PROVEN"}
 
     async def on_interrupt(self, room_id, mode):
         # Real SDK control hook is required because on_message returned early.
@@ -602,6 +683,7 @@ class DurableCodexAdapter(CodexAdapter):
         if self.worker and not self.worker.done():
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
+        await asyncio.to_thread(self.verification.broker.close)
         await super().on_cleanup(room_id)
 
 

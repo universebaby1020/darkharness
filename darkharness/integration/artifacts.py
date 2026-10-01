@@ -73,7 +73,7 @@ def slug(name):
 
 
 RESPONSIBILITIES = {
-    "coordinator": "Coordinate assigned work and route complete tasks to the appropriate peers.",
+    "coordinator": "Coordinate assigned work and route complete tasks to the appropriate peers. Once the assignment is accepted, close it with a final report of the actual accepted revision and evidence to its original requester. Do not silently end with band_no_reply or an empty final text.",
     "builder": "Implement assigned work in the scoped repository and repair findings.",
     "reviewer": "Independently review the exact supplied revision in a separate checkout.",
 }

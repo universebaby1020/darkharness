@@ -354,9 +354,10 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('dh_local_git_commit', [s['name'] for s in starts[0]['dynamicTools']])
         event = self.owner.db.execute("SELECT body FROM c_event WHERE kind='THREAD_TOOLSET_BOUND'").fetchone()
         body = json.loads(event[0])['data']
-        self.assertEqual(body['old_thread'], 'legacy-thread')
+        self.assertIsNone(body['old_thread'])  # SDK metadata is not ownership proof.
         self.assertEqual(body['thread'], 'session')
-        self.assertTrue(body['cutover'])
+        self.assertFalse(body['cutover'])
+        self.assertTrue(self.owner.db.execute("SELECT 1 FROM c_event WHERE kind='OWNED_HISTORY_LINK'").fetchone())
         self.assertIn('original maintenance task', str([p for m, p in self.client.requests if m == 'turn/start'][0]['input']))
 
     async def test_readiness_reader_owned_identity_and_redacted_diagnostic(self):
@@ -392,7 +393,7 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
     async def test_typed_git_tool_through_actual_sdk_dynamic_interface(self):
         import subprocess
         def git(*args):
-            return subprocess.check_output(['git', *args], cwd=self.root, stderr=subprocess.PIPE).decode().strip()
+            return subprocess.check_output(['git', *args], cwd=self.root, stderr=subprocess.PIPE, timeout=5).decode().strip()
         git('init', '-q')
         (self.root / 'base').write_text('base')
         git('add', 'base')
@@ -413,6 +414,19 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         reports = [content for content, typ, meta in self.tools.events if typ in {'tool_call', 'tool_result'}]
         self.assertTrue(any('dh_local_git_commit' in content for content in reports))
         self.assertTrue(any('COMMITTED' in content for content in reports))
+        created_revision = git('rev-parse', 'HEAD')
+        self.client.events = [SimpleNamespace(kind='request', method='item/tool/call', id=52, params={'tool': 'dh_review_snapshot', 'arguments': {'cwd': str(self.root), 'revision': created_revision, 'name': 'independent'}, 'callId': 'snapshot-call'})]
+        await self.deliver(self.message('snapshot', 'review the exact peer revision'))
+        await self.settle()
+        origins = [json.loads(r[0]) for r in self.owner.db.execute("SELECT body FROM c_event WHERE kind='GIT_RUN_ORIGIN'")]
+        self.assertEqual(len(origins), 2)
+        from darkharness.integration.mailbox import digest
+        for origin in origins:
+            effect = self.owner.db.execute('SELECT * FROM c_git_effect WHERE id=?', (origin['id'],)).fetchone()
+            self.assertEqual(origin['run_id'], 'run')
+            self.assertEqual(origin['seat'], 's')
+            self.assertEqual(origin['receipt_sha256'], digest(effect['receipt'].encode()))
+            self.assertNotIn('effect_id', json.loads(effect['receipt']))
 
     async def test_real_sdk_local_rejections_before_intent_and_never_post(self):
         from darkharness.integration.mailbox import digest, encode

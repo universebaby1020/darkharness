@@ -11,6 +11,7 @@ import stat
 from .artifacts import SecretGuard, mandate_checks, render_mandate, slug, snapshot_check
 from .mailbox import IntegrationError, Mailbox, digest, encode
 from .policy import ApprovalRouter
+from .legacy_git_origin import execution_ledger_run
 
 
 class SerializedOwner:
@@ -146,7 +147,8 @@ class SeatManager:
                        emit_diff_events=True, emit_token_usage_events=True)
                 adapter = DurableCodexAdapter(mailbox=self.mailbox, router=router, guard=guard,
                      alias=seat["alias"], display_name=actor, room_id=config["room_id"],
-                     workspace=config["workspace"], coordinator_id=coordinator, config=sdk_config)
+                     workspace=config["workspace"], coordinator_id=coordinator, config=sdk_config,
+                     receipt_run_resolver=execution_ledger_run)
                 adapter.startup_binding_pending = True
                 binding = RuntimeBinding("codex", "0.159.3", config["workspace"], "workspace-write", "on-request",
                       "native-controlled", ("same-UID credential access possible", "Docker/interop not an isolation boundary", "privileged shell wrappers denied", "SDK platform ACK is not exactly-once"),
