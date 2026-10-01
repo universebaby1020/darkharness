@@ -14,6 +14,7 @@ from darkharness.integration.mailbox import IntegrationError, digest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL = Path(os.environ.get("DH_OFFICIAL_ROOT", str(ROOT / "inputs/handoff-20261001/DarkHarness_Opus55_Codex_Handoff_20261001/official/dark-factory-803560d2a678")))
 
 
@@ -101,7 +102,7 @@ class ArtifactTests(unittest.TestCase):
             repo = root / "result"
             repo.mkdir()
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            config = json.loads((ROOT / "darkharness/darkharness/integration/run.example.json").read_text())
+        config = json.loads((SOURCE_ROOT / "darkharness/integration/run.example.json").read_text())
             config["workspace"] = str(repo.resolve())
             config["credentials_path"] = str((root / "nonexistent" / "agents.json").resolve())
             result = validate_config(config)
