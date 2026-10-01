@@ -53,6 +53,7 @@ class Mailbox:
             "CREATE TABLE IF NOT EXISTS c_control(id TEXT PRIMARY KEY, operation TEXT, attempt TEXT, kind TEXT, body TEXT, state TEXT)",
             "CREATE TABLE IF NOT EXISTS c_control_receipt(seat TEXT,room TEXT,sender TEXT,platform_id TEXT,hash TEXT,PRIMARY KEY(seat,room,sender,platform_id))",
             "CREATE TABLE IF NOT EXISTS c_callback(operation TEXT,attempt TEXT,id TEXT,hash TEXT,PRIMARY KEY(operation,attempt,id))",
+            "CREATE TABLE IF NOT EXISTS c_thread_tools(thread TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS c_event(seq INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT, kind TEXT, body TEXT, at TEXT)",
         ]
         with owner.transaction(owner.epoch) as db:

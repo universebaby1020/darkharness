@@ -92,6 +92,8 @@ class SeatManager:
         if self.agents:
             raise IntegrationError("RUN_ALREADY_STARTED")
         validate_config(config)
+        self.adapters.clear()
+        self.runtimes.clear()
         from band import Agent
         from band.config.loader import load_agent_config
         from band.adapters.codex import CodexAdapterConfig
@@ -148,12 +150,35 @@ class SeatManager:
             for agent in self.agents:
                 await agent.start()
             ready = [await runtime.readiness() for runtime in self.runtimes]
+            for agent, adapter in zip(self.agents, self.adapters):
+                if self.bind_room_tools(agent, adapter):
+                    adapter._wake()
             with self.owner.transaction(self.owner.epoch) as db:
                 Mailbox.event(db, None, "RUNTIME_BINDINGS", {"run_id": config["run_id"], "bindings": bindings, "readiness": ready})
             return {"started": 3, "run_id": config["run_id"], "readiness": ready, "bindings": bindings}
         except BaseException:
             await self.stop()
             raise
+
+    def bind_room_tools(self, agent, adapter):
+        # Pinned SDK4 room execution supplies real platform tools. Do not invent
+        # a MessageEvent/new human dispatch merely to recreate a cleared job.
+        from band.runtime.tools import AgentTools
+        context = agent._runtime.runtime.executions.get(adapter.allowed_room)
+        if context is None:
+            return False
+        adapter.raw_tools = AgentTools.from_context(context)
+        return True
+
+    async def wake_continuation(self, operation):
+        work = self.mailbox.read_work(operation)
+        for agent, adapter in zip(self.agents, self.adapters):
+            if adapter.alias == work['seat'] and not adapter.stopping:
+                if not self.bind_room_tools(agent, adapter):
+                    raise IntegrationError('ROOM_CONTEXT_NOT_READY')
+                adapter._wake()
+                return {'continuation': operation, 'wake': 'AUTHORIZED_QUEUE_DRAIN'}
+        raise IntegrationError('SEAT_NOT_RUNNING')
 
     async def stop(self):
         errors = []

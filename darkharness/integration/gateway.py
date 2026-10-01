@@ -20,6 +20,9 @@ from darkharness.gateway import Service, Session
 from darkharness.ipc import DEFAULT_FRAME_BYTES, DEFAULT_PAGE_BYTES, read_frame, write_frame
 from .launch import SeatManager, SerializedOwner
 from .mailbox import IntegrationError, Mailbox
+from .policy import ApprovalRouter
+from .git_broker import LocalGitBroker
+from .recovery import Recovery
 
 
 class IntegrationService(Service):
@@ -48,6 +51,32 @@ class IntegrationService(Service):
         except BaseException as exc:
             code = str(exc) if isinstance(exc, IntegrationError) else type(exc).__name__
             return {"job_id": identifier, "state": "FAILED", "reason": code}
+
+    def recovery(self, operation, grant_id):
+        parent = self.manager.mailbox.read_work(operation)
+        with self.manager.owner.transaction(self.manager.owner.epoch) as db:
+            grant = db.execute("SELECT body FROM controls WHERE kind='grant' AND id=?", (grant_id,)).fetchone()
+        if not grant:
+            raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
+        scope = json.loads(grant[0]).get('scope', {})
+        router = ApprovalRouter(self.manager.owner, grant_id, parent['seat'], parent['room'], scope.get('run_id'), scope.get('workspace', ''))
+        if not router.active():
+            raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
+        broker = LocalGitBroker(self.manager.mailbox, router, 'Recovery observer', 'recovery@actors.invalid', router.workspace)
+        def idle_pids():
+            # Only readiness clients with no attempt binding are exempt. Old or
+            # active native processes cannot be declared safe by the payload.
+            from .codex import OwnedStdioClient, group_members
+            found = set()
+            for adapter in self.manager.adapters:
+                if adapter.worker is not None and not adapter.worker.done():
+                    continue
+                for state in adapter._room_clients.values():
+                    client = state.client
+                    if isinstance(client, OwnedStdioClient) and getattr(client, 'evidence', None) and client.evidence.context is None and client.group is not None:
+                        found.update(identity[0] for identity in group_members(client.group))
+            return found
+        return Recovery(self.manager.mailbox, router, broker, idle_pids)
 
     def close(self):
         # Called outside service.mutex, otherwise the async cleanup cannot commit.
@@ -129,6 +158,32 @@ class IntegrationSession(Session):
                 raise Rejected("SEAT_NOT_RUNNING")
             manager.mailbox.control(req["request_id"], req["operation_id"], payload["attempt"], "cancel", {"seat": payload["seat"]})
             return self.response(req, data={"job_id": service.submit(adapter.cancel_owned(req["operation_id"], payload["attempt"]))})
+        if action == 'integration.recovery.observe':
+            if set(payload) != {'attempt', 'grant_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            recovery = service.recovery(req['operation_id'], payload['grant_id'])
+            return self.response(req, data=recovery.observe(req['operation_id'], payload['attempt']))
+        if action == 'integration.continue':
+            if set(payload) != {'attempt', 'grant_id', 'evidence_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            recovery = service.recovery(req['operation_id'], payload['grant_id'])
+            result = recovery.resume(req['operation_id'], payload['attempt'], payload['evidence_id'])
+            adapter = next((a for a in manager.adapters if a.alias == recovery.router.seat and not a.stopping), None)
+            if adapter is not None:
+                result['wake_job_id'] = service.submit(manager.wake_continuation(result['id']))
+            return self.response(req, data=result)
+        if action == 'integration.git.reconcile':
+            if set(payload) != {'attempt', 'grant_id', 'effect_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            recovery = service.recovery(req['operation_id'], payload['grant_id'])
+            with manager.owner.transaction(manager.owner.epoch) as db:
+                effect = db.execute('SELECT * FROM c_git_effect WHERE id=?', (payload['effect_id'],)).fetchone()
+                if not effect or effect['operation'] != req['operation_id'] or effect['attempt'] != payload['attempt']:
+                    raise Rejected('OWNER_ATTEMPT_FENCE')
+                cap = recovery.router._scope(db).get('local_git_write')
+                if not isinstance(cap, dict):
+                    raise Rejected('TYPED_GIT_GRANT_REQUIRED')
+            return self.response(req, data=recovery.broker.reconcile(payload['effect_id']))
         if action == "integration.reconcile":
             receipt = payload.get("receipt")
             if not isinstance(receipt, dict) or not receipt.get("evidence_refs"):

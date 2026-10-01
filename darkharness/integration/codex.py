@@ -18,14 +18,15 @@ import shlex
 import signal
 import uuid
 
-from band.adapters.codex import CodexAdapter, CodexAdapterConfig
+from band.adapters.codex import CodexAdapter, CodexAdapterConfig, strip_leading_mentions
 from band.core.protocols import to_failure_event
 from band.core.types import PlatformMessage
 from band.integrations.codex.stdio_client import CodexStdioClient
 from band.integrations.codex.types import CodexSessionState
 from band.runtime.tools.schema import ToolCallOutcome, serialize_tool_result
 
-from .artifacts import git_evidence
+from .artifacts import git_evidence, slug
+from .git_broker import LocalGitBroker
 from .contract import PermissionRequest, RuntimeBinding, RuntimeEvent
 from .mailbox import HandoffPart, IntegrationError, digest, encode
 
@@ -50,6 +51,21 @@ def group_members(group):
             except (OSError, ValueError, ProcessLookupError):
                 continue
     return found
+
+
+class ClientEvidence:
+    """One client belongs to at most one attempt, independent of reader ContextVars."""
+    def __init__(self, adapter, context=None):
+        self.adapter, self.context = adapter, context
+        self.client_id = str(uuid.uuid4())
+
+    def bind(self, context):
+        if self.context is not None and self.context != context:
+            raise IntegrationError('CLIENT_ATTEMPT_REBIND_DENIED')
+        self.context = context
+
+    def record(self, kind, data):
+        self.adapter._record_for(self.context, kind, {'payload': data, 'client_id': self.client_id})
 
 
 class OwnedStdioClient(CodexStdioClient):
@@ -125,6 +141,12 @@ class OwnedStdioClient(CodexStdioClient):
 
 READ_TOOLS = {"band_get_participants", "band_lookup_peers", "band_fetch_room_context", "band_list_room_files", "band_read_room_file"}
 SEND_TOOLS = {"band_send_message", "band_send_event", "band_no_reply"}
+GIT_TOOLS = {
+    'dh_local_git_commit': {'description': 'Commit existing seat-authored scoped regular files locally using controller Grant. No shell, push, amend or source generation; expected_head is exact 40-hex current commit.',
+        'inputSchema': {'type': 'object', 'properties': {'cwd': {'type': 'string'}, 'paths': {'type': 'array', 'items': {'type': 'string'}}, 'message': {'type': 'string'}, 'expected_head': {'type': 'string'}}, 'required': ['cwd', 'paths', 'message', 'expected_head'], 'additionalProperties': False}},
+    'dh_review_snapshot': {'description': 'Create an independent exact-revision shallow review checkout in controller-assigned scratch, without overwriting. revision must be exact 40-hex commit, name a fresh directory name.',
+        'inputSchema': {'type': 'object', 'properties': {'cwd': {'type': 'string'}, 'revision': {'type': 'string'}, 'name': {'type': 'string'}}, 'required': ['cwd', 'revision', 'name'], 'additionalProperties': False}}
+}
 
 
 class GuardedTools:
@@ -148,7 +170,7 @@ class GuardedTools:
 
     def get_openai_tool_schemas(self, **kwargs):
         schemas = self.raw.get_openai_tool_schemas(**kwargs)
-        return [s for s in schemas if (s.get("function", {}).get("name") or s.get("name")) in READ_TOOLS | SEND_TOOLS]
+        return [s for s in schemas if (s.get("function", {}).get("name") or s.get("name")) in READ_TOOLS | SEND_TOOLS] + [{'name': name, **schema} for name, schema in GIT_TOOLS.items()]
 
     async def _send(self, method, body):
         self.adapter.guard.require_clean(body)
@@ -186,7 +208,20 @@ class GuardedTools:
 
     async def execute_tool_call_structured(self, name, arguments):
         try:
-            if name == "band_send_message":
+            if name in GIT_TOOLS:
+                self.adapter.guard.require_clean(arguments)
+                required = GIT_TOOLS[name]['inputSchema']['required']
+                if not isinstance(arguments, dict) or set(arguments) != set(required) or not self.call_id:
+                    raise IntegrationError('TYPED_GIT_ARGUMENTS_REQUIRED')
+                identifier = digest(encode([self.operation, self.attempt, self.call_id, name]).encode())
+                method = self.adapter.git_broker.commit if name == 'dh_local_git_commit' else self.adapter.git_broker.snapshot
+                try:
+                    result = method(self.operation, self.attempt, identifier, **arguments)
+                except (OSError, ValueError, TypeError):
+                    raise IntegrationError('LOCAL_GIT_DIAGNOSTIC_REDACTED') from None
+                self.adapter.guard.require_clean(result)
+                self.adapter.mailbox.observe(self.operation, self.attempt, 'LOCAL_GIT_TOOL_RESULT', {'name': name, 'call_id': self.call_id, 'receipt': result})
+            elif name == "band_send_message":
                 result = await self.send_message(**arguments)
             elif name == "band_send_event":
                 result = await self.send_event(**arguments)
@@ -218,6 +253,7 @@ class DurableCodexAdapter(CodexAdapter):
             raise IntegrationError("EXPLICIT_RUNTIME_CONFIG_REQUIRED")
         super().__init__(config=config)
         self.mailbox, self.router, self.guard = mailbox, router, guard
+        self.git_broker = LocalGitBroker(mailbox, router, display_name, slug(display_name) + '@actors.invalid', workspace)
         self.alias, self.display_name = alias, display_name
         self.allowed_room, self.workspace = room_id, str(Path(workspace).resolve())
         self.coordinator_id = coordinator_id  # Actual participant ID, not alias/slug.
@@ -234,22 +270,26 @@ class DurableCodexAdapter(CodexAdapter):
         self.stopping = False
 
     def _record(self, kind, data):
+        self._record_for(self.current.get(), kind, data)
+
+    def _record_for(self, context, kind, data):
         data = self.guard.sanitize(data)
-        current = self.current.get()
-        if current:
-            operation, attempt = current
-            self.mailbox.observe(operation, attempt, kind, data)
-            event = RuntimeEvent(operation, attempt, kind, data)
-            self._events.put_nowait(event)
-            if self.event_sink:
-                self.event_sink(event)
+        operation, attempt = context if context else (None, None)
+        self.mailbox.observe(operation, attempt, kind, data)
+        event = RuntimeEvent(operation, attempt, kind, data)
+        self._events.put_nowait(event)
+        if self.event_sink:
+            self.event_sink(event)
 
     def _build_client(self, config):
         state = self._require_active_client_state()
         if str(Path(state.workspace).resolve()) != self.workspace:
             raise IntegrationError("WORKSPACE_BINDING_MISMATCH")
-        return OwnedStdioClient(command=config.codex_command, cwd=state.workspace,
-                                env=config.codex_env, record=self._record, guard=self.guard)
+        evidence = ClientEvidence(self, self.current.get())
+        client = OwnedStdioClient(command=config.codex_command, cwd=state.workspace,
+                                 env=config.codex_env, record=evidence.record, guard=self.guard)
+        client.evidence = evidence
+        return client
 
     async def on_message(self, msg, tools, history, participants_msg, contacts_msg, *, is_session_bootstrap, room_id):
         if room_id != self.allowed_room or self.stopping:
@@ -262,7 +302,9 @@ class DurableCodexAdapter(CodexAdapter):
         envelope["contacts_msg"] = contacts_msg
         envelope["session_thread"] = history.thread_id
         # Control lane is consumed before normal work, including while busy.
-        text = re.sub(r"^(?:\s*@\[\[[^\]]+\]\])+\s*", "", msg.content).strip()
+        text = strip_leading_mentions(msg.content).strip()
+        # Also accept the native platform typed form before SDK normalization.
+        text = re.sub(r"^(?:\s*@\[\[[^\]]+\]\])+\s*", "", text).strip()
         if text.startswith("/dh-answer "):
             self.mailbox.receive_control(self.alias, room_id, msg.sender_id, msg.id, msg.content)
             first, sep, answer = text.partition("\n")
@@ -301,12 +343,17 @@ class DurableCodexAdapter(CodexAdapter):
             self.mailbox.claim(work["id"], attempt)
             token = self.current.set((work["id"], attempt))
             self._active_room.set(self.allowed_room)
-            self._room_client(self.allowed_room)
+            room_state = self._room_client(self.allowed_room)
+            # Thread choice belongs to this durable WorkItem, never a cached
+            # thread left by a different queued operation on the same seat.
+            self._room_threads.pop(self.allowed_room, None)
+            if room_state.client is not None and hasattr(room_state.client, 'evidence'):
+                room_state.client.evidence.bind((work['id'], attempt))
             self._yielded = False
             self._sdk_outcome = None
             envelope = json.loads(work["input"])
             msg = PlatformMessage(id=envelope.get("id", work["id"]), room_id=self.allowed_room,
-                  content=envelope["content"], sender_id=envelope.get("sender_id", self.coordinator_id),
+                  content=encode({'original_task': envelope['content'], 'peer_answers': envelope.get('peer_answers', []), 'recovery_receipt': envelope.get('recovery_receipt')}) if envelope.get('peer_answers') or envelope.get('recovery_receipt') else envelope['content'], sender_id=envelope.get("sender_id", self.coordinator_id),
                   sender_type=envelope.get("sender_type", "agent"), sender_name=envelope.get("sender_name"),
                   message_type="text", metadata=envelope.get("metadata", {}),
                   created_at=datetime.fromisoformat(envelope.get("created_at", datetime.now(timezone.utc).isoformat())))
@@ -319,6 +366,7 @@ class DurableCodexAdapter(CodexAdapter):
                 await super()._run_turn(msg=msg, tools=tools, history=history,
                       participants_msg=envelope.get("participants_msg"), contacts_msg=envelope.get("contacts_msg"),
                       is_session_bootstrap=True, room_id=self.allowed_room, command=None)
+                await self._retire_owned_client()
                 evidence = self.guard.sanitize(git_evidence(self.workspace))
                 self._record("GIT_RESULT", evidence)
                 outcome = self._sdk_outcome or "failed"
@@ -333,10 +381,46 @@ class DurableCodexAdapter(CodexAdapter):
             except BaseException as exc:
                 # Failure return may leave native effects: fence, don't auto replay.
                 self.mailbox.update(work["id"], attempt, state="PAUSED", delivery="DELIVERY_UNKNOWN", result={"code": type(exc).__name__})
-                self._record("RUNTIME_ERROR", {"code": type(exc).__name__, "replay": "FENCED"})
+                self._record("RUNTIME_ERROR", {"code": type(exc).__name__, "diagnostic": self.guard.redact(str(exc)), "replay": "FENCED"})
                 return
             finally:
+                try:
+                    await self._retire_owned_client()
+                except BaseException as exc:
+                    self._record('PROCESS_STOP_UNKNOWN', {'code': type(exc).__name__})
                 self.current.reset(token)
+
+    async def _retire_owned_client(self):
+        # Readiness may pre-create a client. Once bound, its raw stream is never
+        # relabelled for the next attempt. Resume uses the durable thread id.
+        state = self._active_client_state()
+        if state and isinstance(state.client, OwnedStdioClient):
+            await state.client.close()
+            state.client = None
+            state.initialized = False
+            self._room_threads.pop(self.allowed_room, None)
+
+    async def _ensure_thread(self, *, room_id, history, tools, is_session_bootstrap):
+        # SDK4 cannot refresh dynamicTools on thread/resume. Reuse a thread only
+        # when its durable source/mandate/tool fingerprint matches; otherwise
+        # start a native thread with explicit, evidenced old-thread lineage.
+        sources = {name: digest((Path(__file__).parent / name).read_bytes()) for name in ('codex.py', 'git_broker.py', 'recovery.py')}
+        fingerprint = digest(encode({'tools': self._build_dynamic_tools(tools), 'mandate': digest(self.config.system_prompt.encode()), 'sources': sources}).encode())
+        old_thread = self._room_threads.get(room_id) or history.thread_id
+        cutover = False
+        if old_thread:
+            with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+                registered = db.execute('SELECT fingerprint FROM c_thread_tools WHERE thread=?', (old_thread,)).fetchone()
+            cutover = registered is None or registered[0] != fingerprint
+        if cutover:
+            self._room_threads.pop(room_id, None)
+            self._record('THREAD_TOOLSET_CUTOVER_INTENT', {'old_thread': old_thread, 'fingerprint': fingerprint, 'reason': 'SDK4_resume_cannot_refresh_dynamicTools'})
+            history = CodexSessionState(room_id=room_id)
+        thread = await super()._ensure_thread(room_id=room_id, history=history, tools=tools, is_session_bootstrap=is_session_bootstrap)
+        with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+            db.execute('INSERT OR REPLACE INTO c_thread_tools VALUES(?,?)', (thread, fingerprint))
+        self._record('THREAD_TOOLSET_BOUND', {'thread': thread, 'old_thread': old_thread if cutover else None, 'fingerprint': fingerprint, 'cutover': cutover})
+        return thread
 
     async def _start_turn(self, params):
         if not self.router.active():
