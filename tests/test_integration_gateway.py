@@ -47,6 +47,53 @@ class GatewayTests(unittest.TestCase):
                 p.stdout.close()
                 p.stderr.close()
 
+    def test_controller_continuation_proof_api_and_seat_denial(self):
+        from darkharness.core import Store
+        from darkharness.integration.gateway import IntegrationService, IntegrationSession
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / 'result'
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'base').write_text('seat source')
+            subprocess.run(['git', '-C', str(repo), 'add', 'base'], check=True)
+            subprocess.run(['git', '-C', str(repo), '-c', 'user.name=f', '-c', 'user.email=f@actors.invalid', 'commit', '-qm', 'base'], check=True)
+            store = Store(str(Path(td) / 'state'))
+            service = IntegrationService(store, 1024 * 1024, 16384, OFFICIAL, sys.executable)
+            try:
+                box = service.manager.mailbox
+                op = box.receive('s', 'r', 'peer', 'original', 'full original task')['work']
+                box.claim(op, 'a')
+                box.update(op, 'a', state='FAILED', delivery='RETURNED', thread='legacy-session')
+                session = IntegrationSession(service)
+                session.hello = True
+                def call(action, payload, revision=None):
+                    req = envelope(action, str(time.monotonic_ns()), payload=payload, environment_id=service.environment_id, expected_revision=revision)
+                    req['operation_id'] = op
+                    with service.mutex:
+                        return session.handle(req)
+                grant = call('grant.record', {'id': 'g', 'source': 'controller fixture', 'end_condition': 'user STOP/revoke or run completion', 'scope': {'run_id': 'run', 'workspace': str(repo), 'seats': ['s'], 'rooms': ['r'], 'continuation': {'operations': [op]}}}, 0)
+                self.assertEqual(grant['execution_status'], 'SUCCEEDED')
+                denied = call('integration.continue', {'attempt': 'a', 'grant_id': 'g', 'safe': True})
+                self.assertEqual(denied['public_reason_code'], 'INVALID_RECOVERY_PAYLOAD')
+                observed = call('integration.recovery.observe', {'attempt': 'a', 'grant_id': 'g'})
+                self.assertEqual(observed['execution_status'], 'SUCCEEDED')
+                resumed = call('integration.continue', {'attempt': 'a', 'grant_id': 'g', 'evidence_id': observed['data']['evidence_id']})
+                self.assertEqual(resumed['execution_status'], 'SUCCEEDED')
+                child = box.read_work(resumed['data']['id'])
+                self.assertEqual(child['thread'], 'legacy-session')
+                self.assertEqual(json.loads(child['input'])['content'], 'full original task')
+                self.assertEqual(store.db.execute('SELECT COUNT(*) FROM c_inbox').fetchone()[0], 1)
+                seat = IntegrationSession(service, binding={'credential': 'seat-fixture'})
+                seat.hello = True
+                req = envelope('integration.continue', 'seat', payload={'attempt': 'a', 'grant_id': 'g', 'evidence_id': observed['data']['evidence_id']}, environment_id=service.environment_id)
+                from darkharness.core import Rejected
+                with self.assertRaisesRegex(Rejected, 'SEAT_ACTION_DENIED'):
+                    seat.dispatch(req)
+                self.assertIs(service.manager.owner.mutex, service.mutex)
+                self.assertIs(service.manager.owner.owner, store)
+            finally:
+                service.close()
+                store.close()
+
     def test_async_job_returns_before_model_and_shared_transaction(self):
         from darkharness.core import Store
         from darkharness.integration.gateway import IntegrationService, IntegrationSession
