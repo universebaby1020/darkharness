@@ -102,7 +102,7 @@ class ArtifactTests(unittest.TestCase):
             repo = root / "result"
             repo.mkdir()
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        config = json.loads((SOURCE_ROOT / "darkharness/integration/run.example.json").read_text())
+            config = json.loads((SOURCE_ROOT / "darkharness/integration/run.example.json").read_text())
             config["workspace"] = str(repo.resolve())
             config["credentials_path"] = str((root / "nonexistent" / "agents.json").resolve())
             result = validate_config(config)
