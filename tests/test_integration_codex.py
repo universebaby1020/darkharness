@@ -319,7 +319,7 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         self.client.gate = gate
         await self.deliver(self.message('busy', 'other authorized task'))
         await asyncio.sleep(0)
-        answer = '@kjuho0403/dh-builder /dh-answer ' + q['id'] + '\ncomplete peer answer: 21 bytes'
+        answer = '@example-account/dh-builder /dh-answer ' + q['id'] + '\ncomplete peer answer: 21 bytes'
         with self.assertRaisesRegex(IntegrationError, 'PEER_BINDING_DENIED'):
             await self.deliver(self.message('spoof', answer, 'wrong-sender'))
         await self.deliver(self.message('995e6181-24a1-4115-880f-ed19dc73652b', answer, 'coordinator-id'))
