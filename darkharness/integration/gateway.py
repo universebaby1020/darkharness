@@ -194,12 +194,16 @@ class IntegrationSession(Session):
                 if not isinstance(cap, dict):
                     raise Rejected('TYPED_GIT_GRANT_REQUIRED')
             return self.response(req, data=recovery.broker.reconcile(payload['effect_id']))
-        if action == "integration.reconcile":
-            receipt = payload.get("receipt")
-            if not isinstance(receipt, dict) or not receipt.get("evidence_refs"):
-                raise Rejected("RECONCILIATION_EVIDENCE_REQUIRED")
-            row = manager.mailbox.update(req["operation_id"], payload["attempt"], delivery="RECONCILED", result=receipt)
-            return self.response(req, data={k: row[k] for k in ("id", "attempt", "state", "delivery")})
+        if action in {'integration.reconcile', 'integration.timeout.recover'}:
+            if set(payload) != {'attempt', 'grant_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            from .codex_timeout import CodexTimeoutRecovery
+            base = service.recovery(req['operation_id'], payload['grant_id'])
+            recovery = CodexTimeoutRecovery(base.box, base.router, base.broker, base.idle_client_pids)
+            result = (recovery.recover if action == 'integration.timeout.recover' else recovery.reconcile)(req['operation_id'], payload['attempt'])
+            if result.get('id') and manager.agents:
+                result['wake_job_id'] = service.submit(manager.wake_continuation(result['id']))
+            return self.response(req, data=result)
         if action == "integration.run_end":
             # Controller-only durable end condition; live Grant check sees this.
             run = payload["run_id"]

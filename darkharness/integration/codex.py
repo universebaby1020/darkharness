@@ -19,7 +19,7 @@ import signal
 import uuid
 
 from band.adapters.codex import CodexAdapter, CodexAdapterConfig, strip_leading_mentions
-from band.core.protocols import to_failure_event
+from band.core.protocols import to_failure_event, TurnResultAlreadyReported
 from band.core.types import PlatformMessage
 from band.integrations.codex.stdio_client import CodexStdioClient
 from band.integrations.codex.types import CodexSessionState
@@ -31,7 +31,7 @@ from .verification import VerificationBroker
 from .verification_bridge import VerificationBridge, VerificationYield
 from .thread_ownership import ThreadOwnership
 from .contract import PermissionRequest, RuntimeBinding, RuntimeEvent
-from .mailbox import HandoffPart, IntegrationError, digest, encode
+from .mailbox import HandoffPart, IntegrationError, Mailbox, digest, encode
 
 
 class LocalSendRejected(IntegrationError):
@@ -206,6 +206,25 @@ class GuardedTools:
         self.adapter.guard.require_clean(body)
         if not self.adapter.router.active():
             raise IntegrationError("GRANT_INACTIVE")
+        # A recovery child consumes historical ACKs, never posts the same settled
+        # payload again. Match only authenticated canonical predecessor proofs.
+        from .codex_timeout import CodexTimeoutRecovery
+        recovery = CodexTimeoutRecovery(self.adapter.mailbox, self.adapter.router, self.adapter.git_broker)
+        with self.adapter.mailbox.owner.transaction(self.adapter.mailbox.owner.epoch) as db:
+            prior, _ = recovery._predecessors(db, self.operation)
+            if prior:
+                raw = db.execute('SELECT body FROM c_artifact WHERE hash=?', (prior['id'],)).fetchone()
+                if not raw or digest(raw[0]) != prior['id'] or raw[0].decode() != prior['proof']:
+                    raise IntegrationError('CONTINUATION_LINEAGE_CONFLICT')
+                h = digest(encode(body).encode())
+                for old in json.loads(prior['proof']).get('settled_outbox', []):
+                    if old['hash'] != h or old['state'] != 'ACKED':
+                        continue
+                    actual = db.execute('SELECT * FROM c_outbox WHERE id=?', (old['id'],)).fetchone()
+                    if not actual or dict(actual) != old:
+                        raise IntegrationError('CONTINUATION_OUTBOX_CHANGED')
+                    Mailbox.event(db, self.operation, 'RECOVERED_SEND_READBACK', {'attempt': self.attempt, 'outbox_id': old['id'], 'evidence_id': prior['id'], 'effect': 'ALREADY_ACKED_NOT_REPLAYED'})
+                    return json.loads(old['receipt'])
         self.counter += 1
         identifier = digest(encode([self.operation, self.attempt, self.call_id or "adapter", method, self.counter]).encode())
         old = self.adapter.mailbox.send_readback(identifier, self.operation, body)
@@ -302,7 +321,8 @@ class GuardedTools:
 
 class DurableCodexAdapter(CodexAdapter):
     def __init__(self, *, mailbox, router, guard, alias, display_name, room_id, workspace,
-                 coordinator_id, config, event_sink=None, report_parsers=None, receipt_run_resolver=None):
+                 coordinator_id, config, event_sink=None, report_parsers=None, receipt_run_resolver=None,
+                 auto_recover_settled_timeouts=False):
         if version("band-sdk") != "4.0.0":
             raise IntegrationError("SDK_VERSION_UNSUPPORTED")
         if config.cwd is not None or config.approval_policy != "on-request" or config.sandbox != "workspace-write" or config.sandbox_policy is not None or config.enable_self_config_tools:
@@ -331,6 +351,15 @@ class DurableCodexAdapter(CodexAdapter):
         self._answered_callbacks = set()
         self._events = asyncio.Queue()
         self.stopping = False
+        self.auto_recover_settled_timeouts = auto_recover_settled_timeouts
+        self.recovery_idle_client_pids = lambda: set()
+
+    def recover_settled_timeout(self, operation, attempt):
+        from .codex_timeout import CodexTimeoutRecovery
+        recovery = CodexTimeoutRecovery(self.mailbox, self.router, self.git_broker, self.recovery_idle_client_pids)
+        with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+            auto = self.auto_recover_settled_timeouts and not self.stopping and recovery.automatic_allowed(db)
+        return recovery.recover(operation, attempt) if auto else recovery.reconcile(operation, attempt)
 
     def _record(self, kind, data):
         self._record_for(self.current.get(), kind, data)
@@ -475,6 +504,18 @@ class DurableCodexAdapter(CodexAdapter):
                 # Failure return may leave native effects: fence, don't auto replay.
                 self.mailbox.update(work["id"], attempt, state="PAUSED", delivery="DELIVERY_UNKNOWN", result={"code": type(exc).__name__})
                 self._record("RUNTIME_ERROR", {"code": type(exc).__name__, "diagnostic": self.guard.redact(str(exc)), "replay": "FENCED"})
+                if isinstance(exc, TurnResultAlreadyReported):
+                    try:
+                        # The SDK exception is only a candidate. Retire the owned
+                        # client first; canonical terminal/effect/readback proof
+                        # must pass before any status refinement or continuation.
+                        await self._retire_owned_client()
+                        recovered = self.recover_settled_timeout(work['id'], attempt)
+                        self._record('TIMEOUT_RECOVERY_RESULT', recovered)
+                        if recovered.get('id'):
+                            continue
+                    except IntegrationError as blocked:
+                        self._record('TIMEOUT_RECOVERY_BLOCKED', {'code': str(blocked)})
                 return
             finally:
                 try:

@@ -52,6 +52,8 @@ def validate_config(config):
         raise IntegrationError("MANDATE_SLUG_CONFLICT")
     if not config["model"] or not config["effort"] or not isinstance(config["codex_command"], list) or not config["codex_command"]:
         raise IntegrationError("RUNTIME_SELECTION_REQUIRED")
+    if type(config.get('auto_recover_settled_timeouts', False)) is not bool:
+        raise IntegrationError('AUTO_RECOVERY_POLICY_INVALID')
     timeout = config.get("turn_timeout_s", 180.0)
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise IntegrationError("TIMEOUT_INVALID")
@@ -148,8 +150,10 @@ class SeatManager:
                 adapter = DurableCodexAdapter(mailbox=self.mailbox, router=router, guard=guard,
                      alias=seat["alias"], display_name=actor, room_id=config["room_id"],
                      workspace=config["workspace"], coordinator_id=coordinator, config=sdk_config,
-                     receipt_run_resolver=execution_ledger_run)
+                     receipt_run_resolver=execution_ledger_run,
+                     auto_recover_settled_timeouts=config.get('auto_recover_settled_timeouts', False))
                 adapter.startup_binding_pending = True
+                adapter.recovery_idle_client_pids = self.idle_client_pids
                 binding = RuntimeBinding("codex", "0.159.3", config["workspace"], "workspace-write", "on-request",
                       "native-controlled", ("same-UID credential access possible", "Docker/interop not an isolation boundary", "privileged shell wrappers denied", "SDK platform ACK is not exactly-once"),
                       sdk_config.turn_timeout_s, digest(text.encode()))
@@ -158,6 +162,9 @@ class SeatManager:
                 self.runtimes.append(CodexRuntime(adapter))
                 self.agents.append(agent)
                 bindings.append(asdict(binding))
+            # Historical timeout proof is evaluated before readiness can create
+            # new native processes. No SQLite edits or synthetic Band dispatch.
+            self.recover_timeouts_on_startup()
             # Credentials never leave loader/Agent; no config values in output.
             for agent in self.agents:
                 await agent.start()
@@ -171,6 +178,38 @@ class SeatManager:
         except BaseException:
             await self.stop()
             raise
+
+    def idle_client_pids(self):
+        from .codex import OwnedStdioClient, group_members
+        found = set()
+        for adapter in self.adapters:
+            if adapter.worker is not None and not adapter.worker.done():
+                continue
+            for state in adapter._room_clients.values():
+                client = state.client
+                if isinstance(client, OwnedStdioClient) and getattr(client, 'evidence', None) and client.evidence.context is None and client.group is not None:
+                    found.update(identity[0] for identity in group_members(client.group))
+        return found
+
+    def recover_timeouts_on_startup(self):
+        results = []
+        for adapter in self.adapters:
+            if not adapter.auto_recover_settled_timeouts:
+                continue
+            from .codex_timeout import CodexTimeoutRecovery
+            recovery = CodexTimeoutRecovery(self.mailbox, adapter.router, adapter.git_broker)
+            with self.owner.transaction(self.owner.epoch) as db:
+                if not recovery.automatic_allowed(db):
+                    continue
+                candidates = [dict(r) for r in db.execute("SELECT w.id,w.attempt FROM c_work w LEFT JOIN c_recovery r ON r.operation=w.id AND r.attempt=w.attempt WHERE w.seat=? AND w.room=? AND w.delivery IN ('DELIVERY_UNKNOWN','RECONCILED') AND w.state IN ('PAUSED','FAILED') AND r.continuation IS NULL ORDER BY w.rowid", (adapter.alias, adapter.allowed_room))]
+            for work in candidates:
+                try:
+                    result = recovery.recover(work['id'], work['attempt'])
+                    results.append(result)
+                    self.mailbox.observe(work['id'], work['attempt'], 'STARTUP_TIMEOUT_RECOVERY', result)
+                except IntegrationError as exc:
+                    self.mailbox.observe(work['id'], work['attempt'], 'TIMEOUT_RECOVERY_BLOCKED', {'code': str(exc), 'phase': 'startup'})
+        return results
 
     async def bind_room_tools(self, agent, adapter):
         # Pinned SDK4 room execution supplies real platform tools. Do not invent

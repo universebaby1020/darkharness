@@ -121,17 +121,35 @@ class Recovery:
             Mailbox.event(db, operation, 'SEND_REJECTION_RECONCILED', {'id': outbox_id, **receipt})
             return {'id': outbox_id, 'state': 'REJECTED', **receipt}
 
-    def _parent(self, db, operation, attempt):
+    def _authorized(self, db, operation):
         scope = self.router._scope(db)
         cap = scope.get('continuation') if scope else None
-        if not isinstance(cap, dict) or operation not in cap.get('operations', []):
+        if not isinstance(cap, dict):
+            return False
+        seen = set()
+        while operation not in seen:
+            seen.add(operation)
+            if operation in cap.get('operations', []):
+                return True
+            row = db.execute('SELECT * FROM c_recovery WHERE continuation=?', (operation,)).fetchone()
+            if not row:
+                return False
+            proof = json.loads(row['proof'])
+            if proof['run_id'] != self.router.run_id or proof['grant_id'] != self.router.grant_id or proof['seat'] != self.router.seat or proof['room'] != self.router.room:
+                return False
+            operation = row['operation']
+        return False
+
+    def _parent(self, db, operation, attempt, *, settled_interruption=False):
+        if not self._authorized(db, operation):
             raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
         parent = db.execute('SELECT * FROM c_work WHERE id=?', (operation,)).fetchone()
         if not parent or parent['attempt'] != attempt or parent['seat'] != self.router.seat or parent['room'] != self.router.room:
             raise IntegrationError('OWNER_ATTEMPT_FENCE')
-        if parent['delivery'] not in {'RETURNED', 'YIELDED', 'RECONCILED'} or parent['state'] not in {'SUCCEEDED', 'FAILED', 'CANCELLED', 'PAUSED'} or not parent['thread']:
+        deliveries = {'RETURNED', 'YIELDED', 'RECONCILED'} | ({'DELIVERY_UNKNOWN'} if settled_interruption else set())
+        if parent['delivery'] not in deliveries or parent['state'] not in {'SUCCEEDED', 'FAILED', 'CANCELLED', 'PAUSED'} or not parent['thread']:
             raise IntegrationError('CONTINUATION_DELIVERY_UNKNOWN')
-        if db.execute("SELECT 1 FROM c_outbox o JOIN c_work w ON w.id=o.operation WHERE w.seat=? AND o.state NOT IN ('ACKED','REJECTED')", (parent['seat'],)).fetchone() or db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN')", (parent['seat'],)).fetchone():
+        if db.execute("SELECT 1 FROM c_outbox o JOIN c_work w ON w.id=o.operation WHERE w.seat=? AND o.state NOT IN ('ACKED','REJECTED')", (parent['seat'],)).fetchone() or db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN') AND id!=?", (parent['seat'], operation if settled_interruption else '')).fetchone():
             raise IntegrationError('CONTINUATION_OUTSTANDING_UNKNOWN')
         if db.execute("SELECT 1 FROM c_git_effect WHERE state!='ACKED'").fetchone():
             raise IntegrationError('CONTINUATION_GIT_UNKNOWN')
@@ -206,24 +224,66 @@ class Recovery:
         body = {'identity': identity, 'ref': ref, 'head': head, 'index': digest(self.broker._index_bytes()), 'files': files}
         return {'sha256': digest(encode(body).encode()), **body}
 
+    def _predecessors(self, db, operation):
+        return db.execute('SELECT * FROM c_recovery WHERE continuation=?', (operation,)).fetchone(), []
+
     def observe(self, operation, attempt):
         with self.owner.transaction(self.owner.epoch) as db:
             parent = self._parent(db, operation, attempt)
-            commits = [json.loads(r[0]) for r in db.execute("SELECT receipt FROM c_git_effect WHERE operation=? AND state='ACKED'", (operation,)) if r[0] and json.loads(r[0]).get('state') == 'COMMITTED']
+            prior, ancestors = self._predecessors(db, operation)
+            effects, settled_outbox = [], []
+            for op in list(reversed(ancestors)) + [operation]:
+                effects.extend(dict(r) for r in db.execute("SELECT * FROM c_git_effect WHERE operation=? AND state='ACKED' ORDER BY rowid", (op,)))
+                settled_outbox.extend(dict(r) for r in db.execute("SELECT * FROM c_outbox WHERE operation=? AND state IN ('ACKED','REJECTED') ORDER BY rowid", (op,)))
+            commits = []
+            for effect in effects:
+                receipt = json.loads(effect['receipt']) if effect['receipt'] else {}
+                if receipt.get('state') != 'COMMITTED':
+                    continue
+                creator = db.execute('SELECT attempt FROM c_work WHERE id=?', (effect['operation'],)).fetchone()
+                if not creator or effect['attempt'] != creator['attempt'] or not effect['candidate'] or encode(receipt) != encode(json.loads(effect['candidate'])):
+                    raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
+                index = db.execute('SELECT body FROM c_artifact WHERE hash=?', (receipt['index_after'],)).fetchone()
+                if not index or digest(index[0]) != receipt['index_after']:
+                    raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
+                commits.append(receipt)
+        # A timeout child keeps its acknowledged ancestor receipts; an unrelated
+        # new HEAD must not look like source progress merely because this slice
+        # made no Git call. Validate the exact proof/lineage, not input claims.
+        if prior:
+            prior_id = prior['id']
+            with self.owner.transaction(self.owner.epoch) as db:
+                artifact = db.execute('SELECT body FROM c_artifact WHERE hash=?', (prior_id,)).fetchone()
+            if not prior or not artifact or digest(artifact[0]) != prior_id or artifact[0].decode() != prior['proof']:
+                raise IntegrationError('CONTINUATION_LINEAGE_CONFLICT')
+            proof = json.loads(prior['proof'])
+            if (proof['grant_id'], proof['run_id'], proof['seat'], proof['room']) != (self.router.grant_id, self.router.run_id, parent['seat'], parent['room']):
+                raise IntegrationError('CONTINUATION_LINEAGE_CONFLICT')
+            commits = proof['committed_receipts'] + commits
+            settled_outbox = proof.get('settled_outbox', []) + settled_outbox
         self._quiescent()
         first, second = self.fingerprint(), self.fingerprint()
         if first != second:
             raise IntegrationError('CONTINUATION_SOURCE_CHANGED')
+        previous = None
         for receipt in commits:
-            # Exact receipt/readback, including selected-index reconciliation.
-            if receipt['commit'] != second['head'] or receipt['git_identity'] != second['identity'] or receipt['index_after'] != second['index']:
+            # Immutable object and receipt readback for every acknowledged commit.
+            # Older commits must form the exact chain, not equal the latest HEAD.
+            raw = self.broker._git('cat-file', '-p', receipt['commit']).decode()
+            headers = raw.split('\n\n', 1)[0].splitlines()
+            if receipt['git_identity'] != second['identity'] or receipt['ref'] != second['ref'] or [h[7:] for h in headers if h.startswith('parent ')] != [receipt['parent']] or [h[5:] for h in headers if h.startswith('tree ')] != [receipt['tree']]:
                 raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
+            if previous and (receipt['parent'] != previous['commit'] or receipt['index_before'] != previous['index_after']):
+                raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
+            previous = receipt
+        if previous and (previous['commit'] != second['head'] or previous['index_after'] != second['index']):
+            raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
         proof = {'schema': 'dh-maintenance-proof-v1', 'operation': operation, 'attempt': attempt,
                  'run_id': self.router.run_id, 'grant_id': self.router.grant_id, 'seat': parent['seat'],
                  'room': parent['room'], 'thread': parent['thread'], 'input_sha256': digest(parent['input'].encode()),
                  'delivery': parent['delivery'], 'state': parent['state'], 'source': second,
                  'effect': 'KNOWN_COMMITTED_EFFECT' if commits else 'VERIFIED_NO_OUTSTANDING_EFFECT',
-                 'committed_receipts': commits, 'verification': 'settled delivery + ACKed effects + owned/absent processes + two identical canonical source readbacks'}
+                 'committed_receipts': commits, 'settled_outbox': settled_outbox, 'verification': 'settled delivery + ACKed effects + owned/absent processes + two identical canonical source readbacks'}
         raw = encode(proof).encode()
         identifier = digest(raw)
         with self.owner.transaction(self.owner.epoch) as db:
