@@ -14,7 +14,7 @@ Core 변경 없이 기존 `dh_verify` → VerificationBridge/Broker → `json-cr
 
 1. host가 정확한 `{checkout}/stage-N`을 Docker build한다. 이미지 ID와 unique effect label을 기록한다.
 2. `--internal` network에서 앱을 시작한다. 공식 runner는 고정 ID `sha256:6c82d0825613ef894eb2680ee61ffa23c5d0de6a8857525590b98c9d9663cf76`로 호출한다. tag/latest fallback이나 실행 중 tool 설치는 없다.
-3. checker directory, **개별** committed JSON flow, fixed axe asset을 읽기 전용 mount한다. private scratch만 쓰기 가능한 bind mount이며 `{output}`은 절대 mount하지 않는다. runner는 read-only root와 no-new-privileges를 유지하며 공식 이미지의 기본 사용자(root), HOME, 기본 capability를 사용한다. worker가 link 검사 뒤 scratch 파일 소유권만 controller가 전달한 host uid/gid로 반환한다(0600 유지, host sudo/권한 변경 없음). 최초 구현의 host uid/gid 강제·scratch HOME·cap-drop ALL은 공식 root-local browser 설치 접근 및 private scratch 읽기/소유권 반환과 충돌하므로 제거했다. Docker build 자체는 공식 방식과 같은 host-authorized 실행이며 악성 Dockerfile/같은 UID에 대한 OS 보안 경계라고 주장하지 않는다.
+3. checker directory, **개별** committed JSON flow, fixed axe asset을 읽기 전용 mount한다. private scratch만 쓰기 가능한 bind mount이며 `{output}`은 절대 mount하지 않는다. runner는 read-only root와 no-new-privileges를 유지하며 공식 이미지의 기본 사용자(root), HOME, 기본 capability를 사용한다. worker는 신뢰된 CLI의 정확한 `/scratch`만 대상으로 전체 regular-tree 검사 뒤 루트와 자식을 현재 컨테이너 UID/GID로 넘긴다. `finally`에서 재검사하고 자식→루트 순서로 controller가 전달한 host uid/gid에 반환한다(기존 private mode 유지, 0777 완화·host sudo 없음). 최초 구현의 host uid/gid 강제·scratch HOME·cap-drop ALL은 공식 root-local browser 설치 접근 및 private scratch 읽기/소유권 반환과 충돌하므로 제거했다. Docker build 자체는 공식 방식과 같은 host-authorized 실행이며 악성 Dockerfile/같은 UID에 대한 OS 보안 경계라고 주장하지 않는다.
 4. ERROR placeholder는 private scratch에만 만든다. raw axe/browser 로그, PNG, trace ZIP도 private scratch에 둔다. 페이지의 다른 origin 요청은 차단하며, 페이지/flow로 host command를 실행하지 않는다. JSON flow는 CSS selector와 제한된 Playwright action/assertion 데이터다.
 5. 모든 해당 label의 container/network/app image를 제거하고 Docker daemon 조회가 성공하며 결과가 모두 비었는지 확인한다. Docker build cache까지 제거했다는 주장은 하지 않는다. 별도 run/effect와 공식 runner image는 제거하지 않는다.
 6. host가 scratch의 symlink/ancestor symlink/hardlink/특수 파일을 거절하고 artifact SHA256을 다시 검증한다. check ID/status/schema, runtime tool pins를 검사하고 **count를 다시 계산**한다. 확인된 정리 뒤에만 선언된 `uiqa.json`을 host가 atomic replace로 발행한다. 출력 및 private 파일은 비공개다.
@@ -73,3 +73,11 @@ ERROR report와 private `host-diagnostic.json`/`browser-diagnostic.json`에는 �
 새 freeze/재시험 명령은 `evidence/wo-dh0-02r3-uiqa/repair/API_HANDOFF.md`에 있다. 기존 첫-pass evidence·147개 표·UIQ-T01..T36·영어 addendum은 변경하지 않았다.
 
 Startup 음성 시험은 generic ERROR만으로 인정하지 않는다. 앱의 curated running/status/exit_code(health 로그 제외)를 시작 직후와 브라우저 종료 뒤에 관측한다. `/bin/false` 주입의 exited/exit1과 app_startup_state 또는 navigation 실패를 함께 요구한다. tool_import/browser_launch/axe_scan 오류는 startup 주입의 증거로 세지 않는다. missing axe는 axe_validation/FileNotFoundError, 주입 control은 COMPLETED/exit0와 실제 해당 finding을 요구한다. 관측은 단일 daemon 조회이며 새 retry/timeout/readiness 정책을 넣지 않는다. 최초 Main raw pass boolean은 변경하지 않는다.
+
+### scratch ownership 후속 수정
+
+Main이 전달한 `UIQA_BROWSER_NATIVE_DIAGNOSTIC.json`과 `UIQA_SCRATCH_OWNER_DIAGNOSTIC.json`의 관측 원인은 `/scratch/tmp` 쓰기/탐색 권한이다. 같은 공식 runner·flow·flags에서 scratch 루트와 자식의 소유권 전달 후 return0/cleanup verified를 관측했다는 전달 사실이며, 이 worker의 실제 Docker 재현은 아니다. font-cache 경고를 확정 원인으로 승격하지 않는다.
+
+`browser_worker.main()`은 `/scratch`의 링크(ancestor 포함)·특수 inode·하드링크를 소유권 변경/진단 쓰기 전에 거절한다. 부분 handoff 실패, flow 실패, 진단 쓰기 실패에도 소유권 반환을 시도하며, 반환 검증/변경 실패는 성공 종료가 아니다. 새로운 mount/image/user/HOME/capability/security/timeout/routing 변경은 없고 trace/axe 검사도 유지한다. SIGKILL에서 `finally` 실행과 소유권 반환은 보장되지 않으므로 기존 STOP PARTIAL 및 선언 보고서 no-fake 규칙은 그대로다.
+
+Linux fake 집중 시험, 고정 source/tests/docs 해시 및 Main 재시험 handoff는 `evidence/wo-dh0-02r3-uiqa-scratch-owner/`에 둔다. 소유권 syscall은 모형이며 DrvFS의 FIFO 미지원 때문에 특수 inode type도 모형으로 검사한다. 실제 Docker 여섯 case·full suite·production seal은 여기서 주장하지 않는다.
