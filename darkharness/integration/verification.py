@@ -181,7 +181,23 @@ class VerificationBroker:
             row = db.execute('SELECT * FROM c_git_effect WHERE id=?', (selector,)).fetchone()
             if row:
                 return row
-        elif isinstance(selector, dict):
+            # Native SDK RPC returns object receipts as JSON text. Decode once,
+            # then use exactly the same canonical ACK lookup as object input.
+            # Reject duplicate members/nonfinite numbers rather than losing data.
+            def members(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError('duplicate receipt member')
+                    value[key] = item
+                return value
+            def constant(value):
+                raise ValueError('nonfinite receipt number')
+            try:
+                selector = json.loads(selector, object_pairs_hook=members, parse_constant=constant)
+            except (ValueError, RecursionError):
+                raise IntegrationError('CHECKOUT_RECEIPT_UNKNOWN_OR_AMBIGUOUS') from None
+        if isinstance(selector, dict):
             # Exact canonical returned receipt, not an arbitrary model path.
             rows = db.execute("SELECT * FROM c_git_effect WHERE state='ACKED' AND receipt=?", (encode(selector),)).fetchall()
             if len(rows) == 1:
@@ -380,6 +396,40 @@ class VerificationBroker:
             Mailbox.event(db, row['operation'], 'VERIFICATION_UNKNOWN', {'id': row['id'], 'cause': 'ownership_or_result_uncertain'})
         return {'id': row['id'], 'state': state, 'result': json.loads(row['result']) if row['result'] else None}
 
+    def failure_contract(self, operation, attempt, effect_id):
+        """Diagnostic only: durable ledger proof, never error-text inference.
+
+        NOT_STARTED is not a Store state. A safe retry means no duplicate checker
+        effect, not that identical invalid input will succeed or regain authority.
+        Any durable intent or unresolved run effect forbids a safe-retry claim.
+        """
+        unknown = {'effect_phase': 'UNKNOWN', 'same_input_safe_retry': False,
+                   'retry_message': 'Do not retry; reconcile the existing effect and retain its fence.'}
+        try:
+            with self.lock, self.owner.transaction(self.owner.epoch) as db:
+                work = self._work(db, operation, attempt)
+                row = db.execute('SELECT * FROM c_verification_effect WHERE id=?', (effect_id,)).fetchone()
+                if row:
+                    if row['operation'] != operation or row['attempt'] != attempt:
+                        return unknown
+                    return {**unknown, 'effect_phase': self._view(db, row)['state']}
+                if effect_id in self.jobs or any(not job.done.is_set() for job in self.jobs.values()):
+                    return unknown  # In-memory ownership is also execution evidence.
+                run = db.execute("SELECT body FROM controls WHERE kind='run' AND id=?", (self.router.run_id,)).fetchone()
+                if run and json.loads(run[0]).get('state') in {'UNKNOWN', 'DELIVERY_UNKNOWN', 'EFFECT_UNKNOWN', 'CLOSED_UNRESOLVED'}:
+                    return unknown
+                rows = db.execute("SELECT * FROM c_verification_effect WHERE run_id=? AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT')", (self.router.run_id,)).fetchall()
+                if rows:
+                    # Other seats may have actively owned jobs in another broker.
+                    # Diagnostics must not convert those jobs to UNKNOWN.
+                    return unknown
+                if self.closed or work['state'] != 'RUNNING' or not self.router._scope(db):
+                    return {**unknown, 'effect_phase': 'NOT_STARTED'}
+                return {'effect_phase': 'NOT_STARTED', 'same_input_safe_retry': True,
+                        'retry_message': 'No verification intent exists; retry with the same input is safe from duplicate effects. Existing authority and validation still apply.'}
+        except Exception:
+            return unknown  # Unreadable ledger is never proof of nonexecution.
+
     def start(self, operation, attempt, effect_id, *, check_id, checkout_receipt, revision):
         """Nonblocking job after validation. Use start_async in an SDK loop."""
         try:
@@ -425,7 +475,12 @@ class VerificationBroker:
             try:
                 job.thread.start()
             except BaseException:
-                job.done.set()
+                # Start may be uncertain: request cancellation, retain any owned
+                # started thread for close, and never erase the durable intent.
+                job.cancel.set()
+                if job.thread.ident is None:
+                    job.thread = None  # No joinable thread; intent stays fenced.
+                    job.done.set()
                 raise IntegrationError('VERIFICATION_START_UNKNOWN') from None
             return {'id': effect_id, 'state': 'INTENT', 'result': None}
 

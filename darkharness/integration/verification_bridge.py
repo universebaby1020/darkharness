@@ -34,7 +34,7 @@ class VerificationBridge:
         if not checks:
             return []
         return [
-            {'name': 'dh_verify', 'description': 'Start a configured trusted check of an exact peer revision and snapshot. Ends this native turn; an authenticated completion continues the full task. Starting is NOT success. Never poll or replay UNKNOWN.',
+            {'name': 'dh_verify', 'description': 'Start a configured trusted check of an exact peer revision and snapshot. Ends this native turn; an authenticated completion continues the full task. Starting is NOT success. checkout_receipt accepts the exact returned object, its serialized JSON object text, or a typed effect ID. A NOT_STARTED failure permits same-input retry only when same_input_safe_retry is true; this is not approval or a success guarantee. Never poll or replay UNKNOWN.',
              'inputSchema': {'type': 'object', 'properties': {'check_id': {'type': 'string', 'enum': sorted(checks)}, 'checkout_receipt': {'anyOf': [{'type': 'string'}, {'type': 'object'}]}, 'revision': {'type': 'string', 'pattern': '^[0-9a-f]{40}$'}}, 'required': ['check_id', 'checkout_receipt', 'revision'], 'additionalProperties': False}},
             {'name': 'dh_verification_read', 'description': 'Read a guarded page of a hash-verified completed same-run checker log/report. artifact is a declared report name or stdout/stderr, not a path.',
              'inputSchema': {'type': 'object', 'properties': {'effect_id': {'type': 'string'}, 'artifact': {'type': 'string'}, 'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 16384}}, 'required': ['effect_id', 'artifact', 'offset', 'limit'], 'additionalProperties': False}}

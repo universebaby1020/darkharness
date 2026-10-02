@@ -178,7 +178,11 @@ class GuardedTools:
             return ToolCallOutcome(value=serialize_tool_result(result), ok=True)
         except IntegrationError as exc:
             self.adapter.mailbox.observe(self.operation, self.attempt, "TOOL_BLOCKED", {"code": str(exc), "name": name})
-            return ToolCallOutcome(value={"error": str(exc)}, ok=False, error_message=str(exc))
+            failure = {"error": str(exc)}
+            if name == 'dh_verify':
+                effect = digest(encode([self.operation, self.attempt, self.call_id, 'dh_verify']).encode())
+                failure.update(self.adapter.verification.broker.failure_contract(self.operation, self.attempt, effect))
+            return ToolCallOutcome(value=failure, ok=False, error_message=str(exc))
 
     async def execute_tool_call(self, name, arguments):
         return (await self.execute_tool_call_structured(name, arguments)).value
