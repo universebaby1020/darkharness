@@ -1,0 +1,23 @@
+{
+  "spec_reference": "official dark-factory-803560d2a678/toy/spec/stage-2.md L7-L19 SHA256 8b4800455e681bedcdded8407fb170766d5a73aa91de6feed65782ac3379b493; stage-1.md L13 default port 8080. No shipped test source read. Widths are developer fixture samples, not toy spec mandates.",
+  "author": "DEVELOPER FIXTURE authored by track E worker from official specification only; NOT Band Reviewer-created; NOT future run flow",
+  "viewports": [
+    {"width": 375, "height": 812},
+    {"width": 1280, "height": 720}
+  ],
+  "scenarios": [
+    {
+      "id": "spec-counter-increment-reload",
+      "path": "/",
+      "steps": [
+        {"action": "visible", "selector": "[data-testid=counter-value]"},
+        {"action": "integer", "selector": "[data-testid=counter-value]"},
+        {"action": "visible", "selector": "[data-testid=increment-button]"},
+        {"action": "click", "selector": "[data-testid=increment-button]"},
+        {"action": "integer_delta", "selector": "[data-testid=counter-value]", "value": "1"},
+        {"action": "reload", "selector": "[data-testid=counter-value]"},
+        {"action": "integer_delta", "selector": "[data-testid=counter-value]", "value": "1"}
+      ]
+    }
+  ]
+}
