@@ -55,7 +55,9 @@ class ApprovalRouter:
         with self.owner.transaction(self.owner.epoch) as db:
             scope = self._scope(db)
             if scope and not request.privilege and str(Path(request.workspace).resolve()) == self.workspace:
-                if request.action == "file_write" and request.paths and scope.get("file_write") is True:
+                if request.action == "file_read" and request.paths:
+                    accepted = all(Path(p).is_absolute() and Path(p).resolve().is_relative_to(Path(self.workspace)) for p in request.paths)
+                elif request.action == "file_write" and request.paths and scope.get("file_write") is True:
                     accepted = all(Path(p).is_absolute() and Path(p).resolve().is_relative_to(Path(self.workspace)) for p in request.paths)
                 elif request.action == "command" and request.argv:
                     # Exact controller-reviewed command, not a regex or binary allowlist.

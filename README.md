@@ -94,9 +94,14 @@ python3 -m venv .venv
 
 The integration uses Band SDK 4.0.0 and an independently authenticated Codex CLI.
 Keep agent credentials, run configuration and state outside this repository.
-Configure model and effort per run; role names do not select a model or grant
-authority. The first development runtime is Codex, behind a provider-independent
-contract.
+Configure connection/runtime, model, effort and turn timeout independently per
+seat with named controller-owned profiles. Legacy flat Codex configuration still
+works; the default turn timeout is 3600 seconds. Role names select neither a model
+nor authority. See [seat settings](docs/seat-settings.md) for precedence, safe
+validation/effective settings and the optional protected Claude Code backend.
+Current diagnostic choices remain unchanged; Claude inference qualification is
+NOT_RUN. Claude dependencies belong in a separate environment, not the active
+shared Codex runtime.
 
 Read [the SDK support matrix and launch sequence](docs/sdk-support.md) before
 starting seats. Component tests exercise the real SDK with synthetic RPC clients;

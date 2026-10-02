@@ -16,6 +16,60 @@ class RuntimeBinding:
     limitations: tuple[str, ...]
     effective_timeout_s: float
     prompt_sha256: str
+    connection: str = "legacy"
+    model: str = ""
+    effort: str = ""
+    settings_sha256: str = ""
+    settings_sources: tuple[tuple[str, str], ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True)
+class SeatSettings:
+    """Pinned execution values; origins are evidence, never execution identity.
+
+    Commands and external auth-home references must not be emitted in status.
+    No credential contents belong in this object.
+    """
+    connection: str
+    runtime: str
+    workspace: str
+    model: str
+    effort: str
+    turn_timeout_s: float
+    command: tuple[str, ...] = field(repr=False)
+    runtime_env: tuple[tuple[str, str], ...] = field(repr=False)
+    sources: tuple[tuple[str, str], ...] = field(compare=False)
+
+    @property
+    def fingerprint(self) -> str:
+        import hashlib
+        import json
+        body = {name: getattr(self, name) for name in (
+            "connection", "runtime", "workspace", "model", "effort",
+            "turn_timeout_s", "command", "runtime_env")}
+        return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode()).hexdigest()
+
+    def evidence(self) -> dict[str, Any]:
+        return {"connection": self.connection, "runtime": self.runtime,
+                "model": self.model, "effort": self.effort,
+                "effective_timeout_s": self.turn_timeout_s,
+                "sources": dict(self.sources), "settings_sha256": self.fingerprint}
+
+
+@dataclass(frozen=True)
+class BackendRegistration:
+    """Controller-owned code registration, never an import path from JSON.
+
+    A factory must return a protected adapter, Runtime facade and RuntimeBinding.
+    preflight is local-only and must reject capability/dependency failures before
+    credential loading, Agent creation, native processes or room effects.
+    """
+    harness: str
+    version: str
+    environment_names: frozenset[str]
+    preflight: Callable[[SeatSettings], None]
+    factory: Callable[..., tuple[Any, Any, RuntimeBinding]]
 
 
 @dataclass(frozen=True)

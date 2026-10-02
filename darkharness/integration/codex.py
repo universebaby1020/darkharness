@@ -34,33 +34,6 @@ from .contract import PermissionRequest, RuntimeBinding, RuntimeEvent
 from .mailbox import HandoffPart, IntegrationError, Mailbox, digest, encode
 
 
-class LocalSendRejected(IntegrationError):
-    """Pure preflight rejection; no external boundary has been crossed."""
-
-
-def validate_local_send(raw, method, body):
-    # Pinned SDK4 resolver and Fern models, not string-based exception inference.
-    from band.runtime.tools.agent import AgentTools
-    from band.client.rest import ChatMessageRequest, ChatMessageRequestMentionsItem, ChatEventRequest
-    from band.core.content import has_visible_content
-    from band.core.exceptions import BandToolError
-    from pydantic import ValidationError
-    try:
-        if method == 'send_message':
-            mentions = body['mentions']
-            if mentions is not None and (not isinstance(mentions, list) or any(not isinstance(m, (str, dict)) for m in mentions)):
-                raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
-            # This private seam is pinned to SDK4. It is synchronous and pure.
-            resolved = AgentTools._resolve_required_mentions(raw, mentions)
-            ChatMessageRequest(content=body['content'], mentions=[ChatMessageRequestMentionsItem(**m) for m in resolved])
-        elif method == 'send_event':
-            ChatEventRequest(**body)
-        if not has_visible_content(body['content']):
-            raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
-    except (ValueError, TypeError, AttributeError, BandToolError, ValidationError):
-        raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED') from None
-
-
 class PeerYield(BaseException):
     """Internal control signal: intentionally bypasses SDK generic-error fallback."""
 
@@ -169,157 +142,13 @@ class OwnedStdioClient(CodexStdioClient):
             raise IntegrationError("PROCESS_TERMINATION_UNKNOWN")
 
 
-READ_TOOLS = {"band_get_participants", "band_lookup_peers", "band_fetch_room_context", "band_list_room_files", "band_read_room_file"}
-SEND_TOOLS = {"band_send_message", "band_send_event", "band_no_reply"}
-GIT_TOOLS = {
-    'dh_local_git_commit': {'description': 'Commit existing seat-authored scoped regular files locally using controller Grant. No shell, push, amend or source generation; expected_head is exact 40-hex current commit.',
-        'inputSchema': {'type': 'object', 'properties': {'cwd': {'type': 'string'}, 'paths': {'type': 'array', 'items': {'type': 'string'}}, 'message': {'type': 'string'}, 'expected_head': {'type': 'string'}}, 'required': ['cwd', 'paths', 'message', 'expected_head'], 'additionalProperties': False}},
-    'dh_review_snapshot': {'description': 'Create an independent exact-revision shallow review checkout in controller-assigned scratch, without overwriting. revision must be exact 40-hex commit, name a fresh directory name.',
-        'inputSchema': {'type': 'object', 'properties': {'cwd': {'type': 'string'}, 'revision': {'type': 'string'}, 'name': {'type': 'string'}}, 'required': ['cwd', 'revision', 'name'], 'additionalProperties': False}}
-}
+from .protected_tools import GuardedTools, LocalSendRejected, validate_local_send, READ_TOOLS, SEND_TOOLS, GIT_TOOLS
 
 
-class GuardedTools:
-    """All SDK send paths and dynamic platform tools pass through this facade.
-
-    Unknown platform effects (room creation, memory/contacts, uploads) fail closed.
-    Native CLI/MCP effects outside this facade remain native-controlled/observed.
-    """
-    def __init__(self, raw, adapter, operation, attempt):
-        self.raw, self.adapter = raw, adapter
-        self.operation, self.attempt = operation, attempt
-        self.counter = 0
-        self.call_id = None
-
-    def __getattr__(self, name):
-        # Read-only adapter metadata and schema methods; effect methods must not
-        # silently escape through attribute forwarding.
-        if name in {"participants", "is_hub_room", "get_participants", "lookup_peers", "fetch_room_context", "list_room_files", "read_room_file"}:
-            return getattr(self.raw, name)
-        raise AttributeError(name)
-
-    def get_openai_tool_schemas(self, **kwargs):
-        schemas = self.raw.get_openai_tool_schemas(**kwargs)
-        return [s for s in schemas if (s.get("function", {}).get("name") or s.get("name")) in READ_TOOLS | SEND_TOOLS] + [{'name': name, **schema} for name, schema in GIT_TOOLS.items()] + self.adapter.verification.schemas()
-
-    async def _send(self, method, body):
-        self.adapter.guard.require_clean(body)
-        if not self.adapter.router.active():
-            raise IntegrationError("GRANT_INACTIVE")
-        # A recovery child consumes historical ACKs, never posts the same settled
-        # payload again. Match only authenticated canonical predecessor proofs.
-        from .codex_timeout import CodexTimeoutRecovery
-        recovery = CodexTimeoutRecovery(self.adapter.mailbox, self.adapter.router, self.adapter.git_broker)
-        with self.adapter.mailbox.owner.transaction(self.adapter.mailbox.owner.epoch) as db:
-            prior, _ = recovery._predecessors(db, self.operation)
-            if prior:
-                raw = db.execute('SELECT body FROM c_artifact WHERE hash=?', (prior['id'],)).fetchone()
-                if not raw or digest(raw[0]) != prior['id'] or raw[0].decode() != prior['proof']:
-                    raise IntegrationError('CONTINUATION_LINEAGE_CONFLICT')
-                h = digest(encode(body).encode())
-                for old in json.loads(prior['proof']).get('settled_outbox', []):
-                    if old['hash'] != h or old['state'] != 'ACKED':
-                        continue
-                    actual = db.execute('SELECT * FROM c_outbox WHERE id=?', (old['id'],)).fetchone()
-                    if not actual or dict(actual) != old:
-                        raise IntegrationError('CONTINUATION_OUTBOX_CHANGED')
-                    Mailbox.event(db, self.operation, 'RECOVERED_SEND_READBACK', {'attempt': self.attempt, 'outbox_id': old['id'], 'evidence_id': prior['id'], 'effect': 'ALREADY_ACKED_NOT_REPLAYED'})
-                    return json.loads(old['receipt'])
-        self.counter += 1
-        identifier = digest(encode([self.operation, self.attempt, self.call_id or "adapter", method, self.counter]).encode())
-        old = self.adapter.mailbox.send_readback(identifier, self.operation, body)
-        if old is not None:
-            return old
-        try:
-            validate_local_send(self.raw, method, body)
-        except LocalSendRejected as exc:
-            self.adapter.mailbox.reject_send(identifier, self.operation, self.attempt, body, str(exc))
-            raise
-        old = self.adapter.mailbox.prepare_send(identifier, self.operation, body)
-        if old is not None:
-            return old
-        try:
-            result = await getattr(self.raw, method)(**body)
-            receipt = serialize_tool_result(result)
-            if receipt is None:
-                raise IntegrationError("SEND_ACK_MISSING")
-            self.adapter.guard.require_clean(receipt)
-            self.adapter.mailbox.sent(identifier, receipt)
-            return result
-        except BaseException:
-            self.adapter.mailbox.observe(self.operation, self.attempt, "DELIVERY_UNKNOWN", {"outbox_id": identifier})
-            raise
-
-    async def send_message(self, content, mentions=None):
-        return await self._send("send_message", {"content": content, "mentions": mentions})
-
-    async def send_event(self, content, message_type, metadata=None):
-        return await self._send("send_event", {"content": content, "message_type": message_type, "metadata": metadata})
-
-    async def send_failure(self, failure):
-        content, metadata = to_failure_event(failure)
-        return await self.send_event(content, "error", metadata)
-
-    async def no_reply(self, reason=None):
-        return {"status": "no_reply"}
-
-    async def execute_tool_call_structured(self, name, arguments):
-        try:
-            if name in {'band_send_message', 'band_send_event'}:
-                allowed = {'content', 'mentions'} if name == 'band_send_message' else {'content', 'message_type', 'metadata'}
-                required = {'content'} if name == 'band_send_message' else {'content', 'message_type'}
-                if not isinstance(arguments, dict) or not required <= arguments.keys() or not arguments.keys() <= allowed:
-                    raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
-            if name in GIT_TOOLS:
-                self.adapter.guard.require_clean(arguments)
-                required = GIT_TOOLS[name]['inputSchema']['required']
-                if not isinstance(arguments, dict) or set(arguments) != set(required) or not self.call_id:
-                    raise IntegrationError('TYPED_GIT_ARGUMENTS_REQUIRED')
-                identifier = digest(encode([self.operation, self.attempt, self.call_id, name]).encode())
-                method = self.adapter.git_broker.commit if name == 'dh_local_git_commit' else self.adapter.git_broker.snapshot
-                with self.adapter.mailbox.owner.transaction(self.adapter.mailbox.owner.epoch) as db:
-                    old_ack = db.execute("SELECT 1 FROM c_git_effect WHERE id=? AND state='ACKED'", (identifier,)).fetchone()
-                try:
-                    result = method(self.operation, self.attempt, identifier, **arguments)
-                except (OSError, ValueError, TypeError):
-                    raise IntegrationError('LOCAL_GIT_DIAGNOSTIC_REDACTED') from None
-                # Stamp the actual creating seat; canonical receipt/hash is unchanged.
-                if not old_ack:
-                    VerificationBroker.record_git_origin(self.adapter.mailbox, self.adapter.router, identifier)
-                # An ACK replay is not a creating call. Never backfill a legacy
-                # run from today's Grant; legacy provenance requires Main ledger.
-                self.adapter.guard.require_clean(result)
-                self.adapter.mailbox.observe(self.operation, self.attempt, 'LOCAL_GIT_TOOL_RESULT', {'name': name, 'call_id': self.call_id, 'receipt': result})
-            elif name == 'dh_verify':
-                effect, result = await self.adapter.verification.start(self.operation, self.attempt, self.call_id, arguments)
-                self.adapter._verification_effect = effect
-            elif name == 'dh_verification_read':
-                self.adapter.guard.require_clean(arguments)
-                if not isinstance(arguments, dict) or set(arguments) != {'effect_id', 'artifact', 'offset', 'limit'}:
-                    raise IntegrationError('TYPED_VERIFICATION_ARGUMENTS_REQUIRED')
-                result = await asyncio.to_thread(self.adapter.verification.read_page, self.operation, self.attempt, **arguments)
-            elif name == "band_send_message":
-                result = await self.send_message(**arguments)
-            elif name == "band_send_event":
-                result = await self.send_event(**arguments)
-            elif name == "band_no_reply":
-                result = await self.no_reply(**arguments)
-            elif name in READ_TOOLS:
-                outcome = await self.raw.execute_tool_call_structured(name, arguments)
-                self.adapter.guard.require_clean(outcome.value)
-                return outcome
-            else:
-                raise IntegrationError("PLATFORM_EFFECT_NOT_GRANTED")
-            return ToolCallOutcome(value=serialize_tool_result(result), ok=True)
-        except IntegrationError as exc:
-            self.adapter.mailbox.observe(self.operation, self.attempt, "TOOL_BLOCKED", {"code": str(exc), "name": name})
-            return ToolCallOutcome(value={"error": str(exc)}, ok=False, error_message=str(exc))
-
-    async def execute_tool_call(self, name, arguments):
-        return (await self.execute_tool_call_structured(name, arguments)).value
+from .durable import DurableSeatMixin
 
 
-class DurableCodexAdapter(CodexAdapter):
+class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
     def __init__(self, *, mailbox, router, guard, alias, display_name, room_id, workspace,
                  coordinator_id, config, event_sink=None, report_parsers=None, receipt_run_resolver=None,
                  auto_recover_settled_timeouts=False):
@@ -361,18 +190,6 @@ class DurableCodexAdapter(CodexAdapter):
             auto = self.auto_recover_settled_timeouts and not self.stopping and recovery.automatic_allowed(db)
         return recovery.recover(operation, attempt) if auto else recovery.reconcile(operation, attempt)
 
-    def _record(self, kind, data):
-        self._record_for(self.current.get(), kind, data)
-
-    def _record_for(self, context, kind, data):
-        data = self.guard.sanitize(data)
-        operation, attempt = context if context else (None, None)
-        self.mailbox.observe(operation, attempt, kind, data)
-        event = RuntimeEvent(operation, attempt, kind, data)
-        self._events.put_nowait(event)
-        if self.event_sink:
-            self.event_sink(event)
-
     def _build_client(self, config):
         state = self._require_active_client_state()
         if str(Path(state.workspace).resolve()) != self.workspace:
@@ -382,60 +199,6 @@ class DurableCodexAdapter(CodexAdapter):
                                  env=config.codex_env, record=evidence.record, guard=self.guard)
         client.evidence = evidence
         return client
-
-    async def on_message(self, msg, tools, history, participants_msg, contacts_msg, *, is_session_bootstrap, room_id):
-        if room_id != self.allowed_room or self.stopping:
-            raise IntegrationError("ROOM_BINDING_DENIED")
-        self.raw_tools = tools
-        self.history = history
-        envelope = asdict(msg)
-        envelope["created_at"] = msg.created_at.isoformat()
-        envelope["participants_msg"] = participants_msg
-        envelope["contacts_msg"] = contacts_msg
-        envelope["session_thread"] = history.thread_id
-        # Control lane is consumed before normal work, including while busy.
-        text = strip_leading_mentions(msg.content).strip()
-        # Also accept the native platform typed form before SDK normalization.
-        text = re.sub(r"^(?:\s*@\[\[[^\]]+\]\])+\s*", "", text).strip()
-        if text.startswith("/dh-answer "):
-            self.mailbox.receive_control(self.alias, room_id, msg.sender_id, msg.id, msg.content)
-            first, sep, answer = text.partition("\n")
-            qid = first.split(maxsplit=1)[1]
-            if not sep:
-                raise IntegrationError("PEER_ANSWER_INCOMPLETE")
-            self.mailbox.answer(qid, msg.sender_id, answer)
-            await self._hydrate_startup_tools(tools)
-            self._wake()
-            return
-        part = None
-        content = msg.content
-        try:
-            payload = json.loads(content)
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict) and "dh_handoff" in payload:
-            try:
-                part = HandoffPart(**payload["dh_handoff"])
-                content = payload["content"]
-            except (KeyError, TypeError):
-                raise IntegrationError("HANDOFF_SHAPE_INVALID") from None
-        self.mailbox.receive(self.alias, room_id, msg.sender_id, msg.id, content, envelope=envelope, part=part)
-        await self._hydrate_startup_tools(tools)
-        self._wake()
-        # No await of the model turn or peer reply on the Band room dispatch lane.
-
-    async def _hydrate_startup_tools(self, tools):
-        # A message may race maintenance startup's explicit room bind. Its
-        # receipt is already durable; never start queued work on an empty cache.
-        if self.startup_binding_pending:
-            from .launch import hydrate_room_tools
-            await hydrate_room_tools(tools, getattr(tools, '_ctx', None))
-            self.raw_tools = tools
-            self.startup_binding_pending = False
-
-    def _wake(self):
-        if not self.stopping and not self.startup_binding_pending and self.raw_tools is not None and (self.worker is None or self.worker.done()):
-            self.worker = asyncio.create_task(self._drain())
 
     async def _drain(self):
         while not self.stopping:
@@ -536,9 +299,10 @@ class DurableCodexAdapter(CodexAdapter):
 
     async def _ensure_thread(self, *, room_id, history, tools, is_session_bootstrap):
         # Implementation revision is provenance, not native schema compatibility.
-        sources = {name: digest((Path(__file__).parent / name).read_bytes()) for name in ('codex.py', 'git_broker.py', 'recovery.py', 'verification.py', 'verification_bridge.py', 'thread_ownership.py')}
+        sources = {name: digest((Path(__file__).parent / name).read_bytes()) for name in ('codex.py', 'durable.py', 'protected_tools.py', 'runtime.py', 'git_broker.py', 'recovery.py', 'verification.py', 'verification_bridge.py', 'thread_ownership.py')}
         prompt_hash = digest(self.config.system_prompt.encode())
-        fingerprint = digest(encode({'tools': self._build_dynamic_tools(tools), 'mandate': prompt_hash}).encode())
+        fingerprint = digest(encode({'tools': self._build_dynamic_tools(tools), 'mandate': prompt_hash,
+                                     'binding': getattr(getattr(self, 'effective_settings', None), 'fingerprint', None)}).encode())
         owned = self.thread_ownership.latest(history.thread_id)
         old_thread = owned['thread'] if owned else None
         cutover = bool(owned and owned['compatibility'] != fingerprint)
@@ -707,18 +471,6 @@ class DurableCodexAdapter(CodexAdapter):
         self.mailbox.drain_controls(operation, attempt)
         return {"termination": "OWNED_GROUP_STOPPED", "checker_external_cleanup": "NOT_PROVEN"}
 
-    async def on_interrupt(self, room_id, mode):
-        # Real SDK control hook is required because on_message returned early.
-        # STOP/interrupt never authorize replay of already-started effects.
-        if room_id != self.allowed_room:
-            raise IntegrationError("ROOM_BINDING_DENIED")
-        self.stopping = True
-        with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
-            rows = db.execute("SELECT id,attempt FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN')", (self.alias,)).fetchall()
-        for row in rows:
-            self.mailbox.control(digest(encode([row[0], row[1], str(mode)]).encode()), row[0], row[1], "cancel", {"source": "SDK_control", "mode": str(mode)})
-            await self.cancel_owned(row[0], row[1])
-
     async def on_cleanup(self, room_id):
         self.stopping = True
         if self.worker and not self.worker.done():
@@ -728,7 +480,10 @@ class DurableCodexAdapter(CodexAdapter):
         await super().on_cleanup(room_id)
 
 
-class CodexRuntime:
+from .runtime import DurableRuntime
+
+
+class CodexRuntime(DurableRuntime):
     """Provider translation facade implementing the runtime-independent contract."""
     def __init__(self, adapter):
         self.adapter = adapter
@@ -745,12 +500,20 @@ class CodexRuntime:
         visible = a._visible_model_ids(models)
         if auth.get("type") != "chatgpt" or a.config.model not in visible:
             raise IntegrationError("RUNTIME_NOT_READY")
+        settings = getattr(a, 'effective_settings', None)
         return {"ready": True, "authentication": "chatgpt", "model": a.config.model,
                 "effort": a.config.reasoning_effort, "inference": "NOT_PROBED",
+                "effective_settings": settings.evidence() if settings else None,
                 "effective_timeout_s": a.config.turn_timeout_s,
                 "timeout_source": getattr(a, "turn_timeout_source", "adapter_config")}
 
     async def start(self, binding):
+        settings = getattr(self.adapter, 'effective_settings', None)
+        expected = getattr(self.adapter, 'binding', None)
+        if expected is not None and binding != expected:
+            raise IntegrationError('RUNTIME_BINDING_MISMATCH')
+        if binding.runtime != 'codex' or (settings and binding.settings_sha256 != settings.fingerprint):
+            raise IntegrationError("RUNTIME_BINDING_MISMATCH")
         if binding.workspace != self.adapter.workspace or binding.prompt_sha256 != digest(self.adapter.config.system_prompt.encode()):
             raise IntegrationError("RUNTIME_BINDING_MISMATCH")
         await self.adapter.on_started(self.adapter.display_name, "Scoped factory seat")
@@ -761,38 +524,6 @@ class CodexRuntime:
             raise IntegrationError("OWNER_ATTEMPT_FENCE")
         if row["delivery"] == "DELIVERY_UNKNOWN":
             raise IntegrationError("UNKNOWN_EFFECT_RECONCILIATION_REQUIRED")
+        if not self.adapter.thread_ownership.owned(session):
+            raise IntegrationError("CROSS_BINDING_THREAD_DENIED")
         self.adapter.history = CodexSessionState(thread_id=session, room_id=row["room"])
-
-    async def dispatch(self, turn):
-        if turn.workspace != self.adapter.workspace or turn.room != self.adapter.allowed_room:
-            raise IntegrationError("WORKSPACE_BINDING_MISMATCH")
-        self.adapter.mailbox.receive(self.adapter.alias, turn.room, turn.sender, turn.operation,
-              turn.full_input, envelope={"id": turn.operation, "sender_id": turn.sender, "parent_operation": turn.parent_operation})
-        self.adapter._wake()
-
-    async def events(self):
-        while True:
-            yield await self.adapter._events.get()
-
-    async def permission_reply(self, request):
-        return await self.adapter.router.decide(request)
-
-    async def peer_answer(self, identifier, sender, answer):
-        result = self.adapter.mailbox.answer(identifier, sender, answer)
-        self.adapter._wake()
-        return result
-
-    async def cancel(self, operation, attempt):
-        return await self.adapter.cancel_owned(operation, attempt)
-
-    async def resume(self, operation, attempt):
-        row = self.adapter.mailbox.read_work(operation)
-        if row["attempt"] != attempt or row["delivery"] != "YIELDED":
-            raise IntegrationError("UNKNOWN_EFFECT_RECONCILIATION_REQUIRED")
-        self.adapter._wake()  # Only verified continuations, never original replay.
-
-    async def status(self, operation):
-        return self.adapter.mailbox.read_work(operation)
-
-    async def collect(self, operation):
-        return {"work": self.adapter.mailbox.read_work(operation), "git": git_evidence(self.adapter.workspace)}

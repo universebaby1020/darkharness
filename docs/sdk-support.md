@@ -1,5 +1,11 @@
 # Band SDK 4.0.0 support
 
+좌석별 연결/runtime/model/effort/timeout은 [새 설정 API](seat-settings.md)를 따른다.
+기존 flat Codex 설정과 아래 diagnostic/복구 메커니즘은 유지한다. 선택형
+Claude Code는 실제 protected factory/SDK component 경로가 있으나 실제 inference
+qualification은 NOT_RUN이다. 과거 repair 범위의 fixed-runtime 설명은 후속 run의
+사용자 선택을 제한하지 않는다. optional imports는 Codex-only 환경에서 lazy다.
+
 This integration extends the installed `band.adapters.codex.CodexAdapter`; it does not replace the SDK or patch installed files. `DurableCodexAdapter` uses the inherited turn runner and RPC/event plumbing. `contract.py` defines the provider-independent interface. Compatibility is pinned to SDK **4.0.0**; private hooks below require revalidation before upgrading.
 
 ## Inspected upstream hooks
