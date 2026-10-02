@@ -9,7 +9,7 @@ import sys
 import uuid
 
 from common import (LABEL, PLAYWRIGHT_VERSION, REPORT_FILE, RUNNER_IMAGE,
-                    atomic_json, regular_tree, relative_file, sha256, summarize)
+                    atomic_json, regular_tree, relative_file, safe_exception_class, sha256, summarize)
 
 
 class Docker:
@@ -37,6 +37,12 @@ def checked(docker, *args):
     return result.stdout.decode().strip()
 
 
+def app_state(docker, name):
+    # Curated daemon fields only; never serialize health logs or app messages.
+    template = '{"running":{{.State.Running}},"status":"{{.State.Status}}","exit_code":{{.State.ExitCode}}}'
+    return json.loads(checked(docker, 'inspect', '--format', template, name))
+
+
 def cleanup(docker, effect):
     """No stale PID handling. Remove only this unique effect's labelled objects."""
     selector = f'label={LABEL}={effect}'
@@ -55,9 +61,12 @@ def cleanup(docker, effect):
         return False
 
 
-def candidate_error(scratch, reason):
+def candidate_error(scratch, reason, phase=None, exc=None):
     value = {'execution': 'ERROR', 'checks': [{'id': 'execution', 'status': 'ERROR'}],
              'findings': [], 'artifacts': [], 'error': reason, 'visual_review': 'NOT_PERFORMED'}
+    if phase is not None:
+        value['diagnostic'] = {'phase': phase, 'exception_class': safe_exception_class(exc) if exc else None}
+        atomic_json(scratch / 'host-diagnostic.json', value['diagnostic'])
     # Placeholder is private; not a declared broker report.
     path = scratch / 'error-placeholder.json'
     if not path.exists():
@@ -110,7 +119,6 @@ def execute(args, docker_factory=Docker):
     effect = uuid.uuid4().hex
     scratch = private / ('uiqa-' + effect)
     scratch.mkdir(mode=0o700)
-    (scratch / 'home').mkdir()
     (scratch / 'tmp').mkdir()
     atomic_json(scratch / 'effect.json', {'effect': effect, 'label': f'{LABEL}={effect}', 'state': 'INTENT', 'kill_without_cleanup': 'PARTIAL'})
     docker = docker_factory(scratch)
@@ -121,8 +129,10 @@ def execute(args, docker_factory=Docker):
     flow_info = {'file': args.flow, 'sha256': None}
     app_image = None
     runner_observed = None
+    observed_app_state = None
     code = 1
     stopped = False
+    phase = 'applicability'
     def stop(signum, frame):
         nonlocal stopped
         stopped = True
@@ -138,29 +148,40 @@ def execute(args, docker_factory=Docker):
             report = {'execution': 'COMPLETED', 'checks': [{'id': 'ui-applicability', 'status': 'N/A', 'spec_reference': args.api_only_spec}], 'findings': [], 'artifacts': [], 'viewports': [], 'tools': {'playwright': 'NOT_EXECUTED'}}
             code = 0  # Broker criteria deliberately reject all-N/A; not UI PASS.
         else:
+            phase = 'stage_validation'
             stage = checkout / f'stage-{args.stage}'
             regular_tree(stage)
             relative_file(stage, 'Dockerfile')
+            phase = 'flow_validation'
             flow = relative_file(checkout, args.flow)
             # Only generic committed flow data is consumed; no subprocess/eval from flow.
             from browser_worker import validate_flow
             validate_flow(json.loads(flow.read_text(encoding='utf-8')))
             flow_info['sha256'] = sha256(flow)
+            phase = 'axe_validation'
             axe = Path(args.axe).absolute()
             regular_tree(axe)
             if sha256(axe) != args.axe_sha256:
                 raise ValueError('AXE_PIN_MISMATCH')
+            phase = 'runner_inspect'
             runner_observed = checked(docker, 'image', 'inspect', '--format', '{{.Id}}', RUNNER_IMAGE)
             if runner_observed != RUNNER_IMAGE:
                 raise ValueError('RUNNER_PIN_MISMATCH')
             network = 'uiqa-' + effect
             label = f'{LABEL}={effect}'
             iid = scratch / 'app-image-id'
+            phase = 'app_build'
             checked(docker, 'build', '--force-rm', '--label', label, '--iidfile', str(iid), str(stage))
             app_image = iid.read_text().strip()
+            phase = 'network_create'
             checked(docker, 'network', 'create', '--internal', '--label', label, network)
+            phase = 'app_start'
             checked(docker, 'run', '-d', '--name', network + '-app', '--label', label,
                     '--network', network, '--network-alias', 'app', app_image)
+            phase = 'app_startup_state'
+            observed_app_state = app_state(docker, network + '-app')
+            if observed_app_state['status'] == 'exited':
+                raise RuntimeError('APP_EXITED_BEFORE_BROWSER')
             # Output is NEVER mounted. Checker, individual flow and fixed axe read-only.
             mounts = []
             for src, dst, ro in ((Path(__file__).parent.absolute(), '/checker', True),
@@ -169,13 +190,18 @@ def execute(args, docker_factory=Docker):
                 if ',' in str(src):
                     raise ValueError('MOUNT_PATH_INVALID')
                 mounts += ['--mount', f'type=bind,src={src},dst={dst}' + (',readonly' if ro else '')]
+            phase = 'browser_run'
+            # Official image installs under root's cache: preserve its default
+            # user/HOME/capabilities, not host UID or a different HOME.
+            # Worker returns scratch ownership to host without sudo on the host.
             result = docker('run', '--name', network + '-browser', '--label', label,
-                            '--network', network, '--read-only', '--cap-drop', 'ALL',
-                            '--security-opt', 'no-new-privileges', '--user', f'{os.getuid()}:{os.getgid()}',
-                            '-e', 'HOME=/scratch/home', '-e', 'TMPDIR=/scratch/tmp',
+                            '--network', network, '--read-only',
+                            '--security-opt', 'no-new-privileges', '-e', 'TMPDIR=/scratch/tmp',
                             '-e', 'PYTHONDONTWRITEBYTECODE=1', *mounts, RUNNER_IMAGE,
-                            'python3', '-B', '/checker/browser_worker.py', '/flow.json', '/axe.min.js', '/scratch', f'http://app:{args.port}')
+                            'python3', '-B', '/checker/browser_worker.py', '/flow.json', '/axe.min.js', '/scratch', f'http://app:{args.port}',
+                            '--host-uid', str(os.getuid()), '--host-gid', str(os.getgid()))
             code = result.returncode
+            phase = 'candidate_read'
             regular_tree(scratch)
             candidate = scratch / 'candidate.json'
             if candidate.exists():
@@ -183,16 +209,19 @@ def execute(args, docker_factory=Docker):
                 if code != 0:
                     report['execution'] = 'ERROR'
             else:
+                report = candidate_error(scratch, 'BROWSER_CANDIDATE_MISSING', phase)
                 code = code or 1
+            phase = 'app_state_observation'
+            observed_app_state = app_state(docker, network + '-app')
         if stopped:
             code = 1
     except KeyboardInterrupt:
         code = 1
-        report = candidate_error(scratch, 'STOP_OR_CANCEL')
-    except Exception:
+        report = candidate_error(scratch, 'STOP_OR_CANCEL', phase, KeyboardInterrupt())
+    except Exception as exc:
         code = 1
         # No exception text: app/flow data could contain secrets.
-        report = candidate_error(scratch, 'HOST_OR_CONTAINER_ERROR')
+        report = candidate_error(scratch, 'HOST_OR_CONTAINER_ERROR', phase, exc)
     finally:
         verified = cleanup(docker, effect)
         for sig, handler in previous.items():
@@ -200,6 +229,7 @@ def execute(args, docker_factory=Docker):
     if not verified:
         atomic_json(scratch / 'cleanup-unknown.json', {'execution': 'PARTIAL', 'cleanup': 'UNKNOWN', 'effect': effect})
         return 1  # No declared report: existing broker UNKNOWN fence.
+    report['app_state'] = observed_app_state
     try:
         publish(output, scratch, report, revision=revision, effect=effect, axe=axe_info, flow=flow_info, app_image=app_image, runner_observed=runner_observed, network_effect=not bool(args.api_only_spec))
     except Exception:
