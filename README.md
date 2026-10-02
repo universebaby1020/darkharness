@@ -4,6 +4,9 @@ An original, runtime-independent Linux execution foundation with an explicit
 Windows-to-WSL Host Bridge. This is Factory infrastructure, not a challenge
 submission or a prebuilt domain solution.
 
+See the [dated integration evidence and remaining limits](docs/integration-status-20261002.md)
+for the distinction between component checks, real Docker checks, and native seat qualification.
+
 ## Current scope
 
 Implemented: empty-state bootstrap, directory-inode OS owner lock, SQLite WAL
