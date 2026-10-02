@@ -291,6 +291,8 @@ class VerificationBroker:
             raise IntegrationError('FIXED_ARGV_REQUIRED')
         if not {'{checkout}', '{output}'}.issubset(argv) or any(('{' in x or '}' in x) and x not in {'{checkout}', '{output}'} for x in argv):
             raise IntegrationError('EXACT_PLACEHOLDERS_REQUIRED')
+        if cfg.get('output_layout', 'checker-owned-v1') not in {'checker-owned-v1', 'broker-owned-v0'}:
+            raise IntegrationError('OUTPUT_LAYOUT_INVALID')
         output = _path(cfg.get('output_root'), exists=False)
         checkout = _path(cfg.get('checkout_root'), exists=False)
         if output.is_relative_to(source) or output.is_relative_to(checkout) or source.is_relative_to(output) or checkout.is_relative_to(output):
@@ -413,7 +415,8 @@ class VerificationBroker:
                 executable_identity = self._configuration(cfg)[4]
                 checkout, provenance = self._receipt(db, operation, attempt, snapshot, revision, binding, cfg)
                 config = encode({'check': cfg, 'restriction': binding, 'provenance': provenance, 'executable': executable_identity})
-                output = str(Path(cfg['output_root']) / uuid.uuid4().hex)
+                base = Path(cfg['output_root']) / uuid.uuid4().hex
+                output = str(base / 'reports' if cfg.get('output_layout', 'checker-owned-v1') == 'checker-owned-v1' else base)
                 db.execute("INSERT INTO c_verification_effect VALUES(?,?,?,?,?,?,'INTENT',?,?,NULL,NULL)", (effect_id, operation, attempt, self.router.run_id, encode(request), config, self.token, output))
                 Mailbox.event(db, operation, 'VERIFICATION_INTENT', {'attempt': attempt, 'id': effect_id, 'request': request, 'config_sha256': digest(config.encode()), 'output': output, 'effects': cfg['effects'], 'limit_source': cfg.get('limit_source')})
             job = _Job()
@@ -449,22 +452,29 @@ class VerificationBroker:
     def _run(self, job, operation, attempt, identifier, request, cfg, binding, provenance, executable_identity, checkout, output):
         state, reason, code = 'UNKNOWN', 'PROCESS_OR_RESULT_UNCERTAIN', None
         artifacts = {}
+        private = output.parent / 'private' if cfg.get('output_layout', 'checker-owned-v1') == 'checker-owned-v1' else output
         try:
             _path(str(output.parent), exists=False).mkdir(mode=0o700, parents=True, exist_ok=True)
             _path(str(output.parent))
-            output.mkdir(mode=0o700)  # fresh exclusive directory, never reused
+            if private != output:
+                # Report leaf intentionally does not exist: checker owns creation.
+                if output.exists() or output.is_symlink():
+                    raise IntegrationError('REPORT_OUTPUT_ALREADY_EXISTS')
+                private.mkdir(mode=0o700)
+            else:
+                output.mkdir(mode=0o700)  # explicit legacy layout
             for name in ('home', 'tmp', 'docker-config'):
-                (output / name).mkdir(mode=0o700)
+                (private / name).mkdir(mode=0o700)
             source, cwd, exe, root, current_executable = self._configuration(cfg)
             if current_executable != executable_identity:
                 raise IntegrationError('EXECUTABLE_TARGET_CHANGED')
             argv = [str(exe), *[str(checkout) if x == '{checkout}' else str(output) if x == '{output}' else x for x in cfg['argv']]]
             env = _env()
             env.update(cfg.get('environment', {}))
-            env.update(HOME=str(output / 'home'), TMPDIR=str(output / 'tmp'), DOCKER_CONFIG=str(output / 'docker-config'))
-            with (output / 'stdout').open('xb') as stdout, (output / 'stderr').open('xb') as stderr:
-                os.chmod(output / 'stdout', 0o600)
-                os.chmod(output / 'stderr', 0o600)
+            env.update(HOME=str(private / 'home'), TMPDIR=str(private / 'tmp'), DOCKER_CONFIG=str(private / 'docker-config'))
+            with (private / 'stdout').open('xb') as stdout, (private / 'stderr').open('xb') as stderr:
+                os.chmod(private / 'stdout', 0o600)
+                os.chmod(private / 'stderr', 0o600)
                 with self.owner.transaction(self.owner.epoch) as db:
                     if job.cancel.is_set() or not self._live(db, operation, attempt, request, cfg, binding):
                         state, reason = 'CANCELLED', 'STOP_REVOKE_OR_CANCEL'
@@ -487,7 +497,7 @@ class VerificationBroker:
                         elif cfg.get('timeout_seconds') is not None and time.monotonic() - began >= cfg['timeout_seconds']:
                             state, reason = 'TIMED_OUT', 'EXPLICIT_CONTROLLER_TIMEOUT'
                             self._kill(job)
-                        elif cfg.get('max_log_bytes') is not None and sum((output / n).stat().st_size for n in ('stdout', 'stderr')) > cfg['max_log_bytes']:
+                        elif cfg.get('max_log_bytes') is not None and sum((private / n).stat().st_size for n in ('stdout', 'stderr')) > cfg['max_log_bytes']:
                             state, reason = 'FAILED', 'EXPLICIT_CONTROLLER_LOG_LIMIT'
                             self._kill(job)
                         # Observe without reaping: the leader PID still pins our
@@ -501,7 +511,7 @@ class VerificationBroker:
                     if state not in {'CANCELLED', 'TIMED_OUT', 'FAILED'}:
                         state, reason = ('FAILED', 'CHECKER_NONZERO') if code else ('UNKNOWN', 'REPORT_UNVERIFIED')
             for name in ('stdout', 'stderr'):
-                artifacts[name] = _hash_file(output / name)
+                artifacts[name] = _hash_file(private / name)
             if code is not None and state not in {'CANCELLED', 'TIMED_OUT'}:
                 for name in cfg['report_files']:
                     artifacts[name] = _hash_file(output / name)
@@ -523,14 +533,31 @@ class VerificationBroker:
                 except (OSError, subprocess.TimeoutExpired):
                     pass
             if state not in {'CANCELLED', 'TIMED_OUT'}:
-                state, reason = 'UNKNOWN', 'PROCESS_OR_REPORT_UNCERTAIN'
+                if code is not None and code != 0 and not any(cfg['effects'].values()):
+                    state, reason = 'FAILED', 'CHECKER_NONZERO_REPORT_UNVERIFIED'
+                else:
+                    state, reason = 'UNKNOWN', 'PROCESS_OR_REPORT_UNCERTAIN'
             for name in ('stdout', 'stderr'):
                 try:
-                    artifacts[name] = _hash_file(output / name)
+                    artifacts[name] = _hash_file(private / name)
                 except (OSError, IntegrationError):
                     pass
         finally:
-            result = {'state': state, 'reason': reason, 'accepted': state == 'SUCCEEDED', 'exit_code': code, 'output': str(output), 'artifacts': artifacts, 'report_contract': cfg['report_contract'], 'limit_source': cfg.get('limit_source'), 'effects': cfg['effects'], 'revision': request['revision'], 'checkout_receipt': request['checkout_receipt'], 'source_commit_effect': provenance['commit_effect'], 'run_id': self.router.run_id}
+            result = {'state': state, 'reason': reason, 'accepted': state == 'SUCCEEDED', 'exit_code': code, 'output': str(output), 'output_layout': cfg.get('output_layout', 'checker-owned-v1'), 'artifacts': artifacts, 'report_contract': cfg['report_contract'], 'limit_source': cfg.get('limit_source'), 'effects': cfg['effects'], 'revision': request['revision'], 'checkout_receipt': request['checkout_receipt'], 'source_commit_effect': provenance['commit_effect'], 'run_id': self.router.run_id}
+            # Preserve process failure separately from uncertain declared external
+            # effects. Only the trusted pinned recognizer proves preexecution.
+            result['process_state'] = 'FAILED' if code is not None and code != 0 else 'EXITED' if code == 0 else 'UNKNOWN'
+            if (code == 2 and state not in {'CANCELLED', 'TIMED_OUT'} and
+                    cfg.get('source_head') == '803560d2a678ace1414465c098eb0ab5380ffade' and
+                    all(artifacts.get(n, {}).get('bytes', 1048577) <= 1048576 for n in ('stdout', 'stderr'))):
+                try:
+                    from .checker_preflight import official_output_exists
+                    recognized = official_output_exists(cfg, argv, result, (private / 'stdout').read_bytes(), (private / 'stderr').read_bytes())
+                    if recognized:
+                        state, reason = 'FAILED', 'VERIFIED_PREEXECUTION_REFUSAL'
+                        result.update(state=state, reason=reason, external_execution='NOT_EXECUTED', preflight_recognition=recognized)
+                except (OSError, IntegrationError, ValueError, IndexError):
+                    pass  # No generic error-text fallback, preserve original uncertainty.
             try:
                 with self.owner.transaction(self.owner.epoch) as db:
                     raw = encode(result).encode()

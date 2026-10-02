@@ -746,7 +746,9 @@ class CodexRuntime:
         if auth.get("type") != "chatgpt" or a.config.model not in visible:
             raise IntegrationError("RUNTIME_NOT_READY")
         return {"ready": True, "authentication": "chatgpt", "model": a.config.model,
-                "effort": a.config.reasoning_effort, "inference": "NOT_PROBED"}
+                "effort": a.config.reasoning_effort, "inference": "NOT_PROBED",
+                "effective_timeout_s": a.config.turn_timeout_s,
+                "timeout_source": getattr(a, "turn_timeout_source", "adapter_config")}
 
     async def start(self, binding):
         if binding.workspace != self.adapter.workspace or binding.prompt_sha256 != digest(self.adapter.config.system_prompt.encode()):

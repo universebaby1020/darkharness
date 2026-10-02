@@ -107,6 +107,19 @@ class ArtifactTests(unittest.TestCase):
             config["credentials_path"] = str((root / "nonexistent" / "agents.json").resolve())
             result = validate_config(config)
             self.assertEqual(result["credentials"], "NOT_READ")
+            self.assertEqual(result['effective_timeout_s'], 3600.0)
+            self.assertEqual(result['timeout_source'], 'explicit_config')
+            del config['turn_timeout_s']
+            self.assertEqual(validate_config(config)['effective_timeout_s'], 3600.0)
+            self.assertEqual(validate_config(config)['timeout_source'], 'USER_DEFAULT_3600')
+            for valid in (0.25, 1, 7200.5, 10**20):
+                config['turn_timeout_s'] = valid
+                self.assertEqual(validate_config(config)['effective_timeout_s'], valid)
+            for bad in (True, False, float('nan'), float('inf'), -float('inf'), 0, -1, '3600'):
+                config['turn_timeout_s'] = bad
+                with self.assertRaisesRegex(IntegrationError, 'TIMEOUT_INVALID'):
+                    validate_config(config)
+            config['turn_timeout_s'] = 3600.0
             result = prepare(config, OFFICIAL, sys.executable)
             self.assertEqual(len(result["snapshots"]), 3)
             self.assertFalse(Path(config["credentials_path"]).exists())

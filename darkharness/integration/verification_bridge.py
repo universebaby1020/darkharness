@@ -85,18 +85,24 @@ class VerificationBridge:
             if not scope or not still_authorized or uncertain or pending_stop or not parent or parent['attempt'] != attempt or parent['seat'] != self.router.seat or parent['room'] != self.router.room or parent['state'] != 'RUNNING' or parent['delivery'] not in {'STARTED', 'DISPATCHING'} or result['state'] not in {'SUCCEEDED', 'FAILED'}:
                 Mailbox.event(db, operation, 'VERIFICATION_COMPLETION_EVIDENCE_ONLY', {'attempt': attempt, 'effect': effect, 'result_ref': ref})
                 return None
-            public = {k: result.get(k) for k in ('state', 'accepted', 'exit_code', 'reason', 'revision')}
-            public.update(id=effect, result_ref=ref, artifact_hashes={k: v['sha256'] for k, v in result['artifacts'].items()})
-            self.guard.require_clean(public)
-            body = json.loads(parent['input'])
-            body['content'] = encode({'original_task': body['content'], 'verification_result': public})
-            body['parent_operation'] = operation
-            child = digest(encode([effect, ref, 'verification-continuation']).encode())
-            db.execute("INSERT INTO c_work VALUES(?,?,?,?,NULL,'QUEUED','READY',?,NULL)", (child, parent['seat'], parent['room'], encode(body), parent['thread']))
-            db.execute('INSERT INTO c_verification_continuation VALUES(?,?,?)', (effect, ref, child))
-            db.execute("UPDATE c_work SET state='PAUSED',delivery='YIELDED' WHERE id=? AND attempt=?", (operation, attempt))
-            Mailbox.event(db, operation, 'VERIFICATION_CONTINUATION', {'attempt': attempt, 'effect': effect, 'result_ref': ref, 'child': child})
-            return child
+            return self._queue(db, parent, result, ref, effect, attempt)
+
+    def _queue(self, db, parent, result, ref, effect, attempt):
+        operation = parent['id']
+        public = {k: result.get(k) for k in ('state', 'accepted', 'exit_code', 'reason', 'revision')}
+        if result.get('external_execution') == 'NOT_EXECUTED':
+            public['external_execution'] = 'NOT_EXECUTED'
+        public.update(id=effect, result_ref=ref, artifact_hashes={k: v['sha256'] for k, v in result['artifacts'].items()})
+        self.guard.require_clean(public)
+        body = json.loads(parent['input'])
+        body['content'] = encode({'original_task': body['content'], 'verification_result': public})
+        body['parent_operation'] = operation
+        child = digest(encode([effect, ref, 'verification-continuation']).encode())
+        db.execute("INSERT INTO c_work VALUES(?,?,?,?,NULL,'QUEUED','READY',?,NULL)", (child, parent['seat'], parent['room'], encode(body), parent['thread']))
+        db.execute('INSERT INTO c_verification_continuation VALUES(?,?,?)', (effect, ref, child))
+        db.execute("UPDATE c_work SET state='PAUSED',delivery='YIELDED' WHERE id=? AND attempt=?", (operation, attempt))
+        Mailbox.event(db, operation, 'VERIFICATION_CONTINUATION', {'attempt': attempt, 'effect': effect, 'result_ref': ref, 'child': child})
+        return child
 
     def read_page(self, operation, attempt, *, effect_id, artifact, offset, limit):
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 16384:
@@ -112,8 +118,11 @@ class VerificationBridge:
             if not creator or creator['seat'] not in scope.get('seats', []) or creator['room'] != self.router.room or artifact not in ['stdout', 'stderr', *cfg['report_files']]:
                 raise IntegrationError('SAME_RUN_RESULT_REQUIRED')
             item = result['artifacts'].get(artifact)
-            expected = Path(row['output']) / artifact
-            if not item or item['path'] != str(expected) or not expected.is_relative_to(Path(row['output'])):
+            root = Path(row['output'])
+            if artifact in {'stdout', 'stderr'} and result.get('output_layout', 'broker-owned-v0') == 'checker-owned-v1':
+                root = root.parent / 'private'
+            expected = root / artifact
+            if not item or item['path'] != str(expected) or not expected.is_relative_to(root):
                 raise IntegrationError('ARTIFACT_BINDING_MISMATCH')
         # Full-file guarding BEFORE paging avoids splitting a secret across pages.
         # This is an export cap, not a checker runtime/disk budget.

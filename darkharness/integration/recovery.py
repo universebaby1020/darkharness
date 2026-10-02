@@ -13,6 +13,7 @@ import stat
 
 from .mailbox import IntegrationError, Mailbox, digest, encode
 from .git_broker import regular_path
+from .index_evidence import indexed_entries, tree_entries, same_source
 
 
 class Recovery:
@@ -221,8 +222,12 @@ class Recovery:
                 if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                     raise IntegrationError('CONTINUATION_SOURCE_CHANGED')
                 files.append([rel, digest(raw), len(raw), stat.S_IMODE(after.st_mode)])
-        body = {'identity': identity, 'ref': ref, 'head': head, 'index': digest(self.broker._index_bytes()), 'files': files}
-        return {'sha256': digest(encode(body).encode()), **body}
+        raw_index = self.broker._index_bytes()
+        indexed = indexed_entries(raw_index)
+        if indexed != tree_entries(self.broker, head):
+            raise IntegrationError('CONTINUATION_INDEX_TREE_MISMATCH')
+        body = {'identity': identity, 'ref': ref, 'head': head, 'indexed_entries': indexed, 'files': files}
+        return {'sha256': digest(encode(body).encode()), 'index': digest(raw_index), **body}
 
     def _predecessors(self, db, operation):
         return db.execute('SELECT * FROM c_recovery WHERE continuation=?', (operation,)).fetchone(), []
@@ -263,7 +268,7 @@ class Recovery:
             settled_outbox = proof.get('settled_outbox', []) + settled_outbox
         self._quiescent()
         first, second = self.fingerprint(), self.fingerprint()
-        if first != second:
+        if not same_source(first, second):
             raise IntegrationError('CONTINUATION_SOURCE_CHANGED')
         previous = None
         for receipt in commits:
@@ -273,10 +278,20 @@ class Recovery:
             headers = raw.split('\n\n', 1)[0].splitlines()
             if receipt['git_identity'] != second['identity'] or receipt['ref'] != second['ref'] or [h[7:] for h in headers if h.startswith('parent ')] != [receipt['parent']] or [h[5:] for h in headers if h.startswith('tree ')] != [receipt['tree']]:
                 raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
-            if previous and (receipt['parent'] != previous['commit'] or receipt['index_before'] != previous['index_after']):
+            with self.owner.transaction(self.owner.epoch) as db:
+                for key, tree in (('index_before', receipt['parent']), ('index_after', receipt['tree'])):
+                    artifact = db.execute('SELECT body FROM c_artifact WHERE hash=?', (receipt[key],)).fetchone()
+                    # Legacy broker preserved only the before hash. Its trusted
+                    # receipt + exact parent chain and every after index/tree
+                    # still bind committed contents; never infer missing bytes.
+                    if key == 'index_before' and artifact is None:
+                        continue
+                    if not artifact or digest(artifact[0]) != receipt[key] or indexed_entries(artifact[0]) != tree_entries(self.broker, tree):
+                        raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
+            if previous and receipt['parent'] != previous['commit']:
                 raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
             previous = receipt
-        if previous and (previous['commit'] != second['head'] or previous['index_after'] != second['index']):
+        if previous and (previous['commit'] != second['head'] or tree_entries(self.broker, previous['tree']) != second['indexed_entries']):
             raise IntegrationError('CONTINUATION_COMMIT_UNKNOWN')
         proof = {'schema': 'dh-maintenance-proof-v1', 'operation': operation, 'attempt': attempt,
                  'run_id': self.router.run_id, 'grant_id': self.router.grant_id, 'seat': parent['seat'],
@@ -311,7 +326,7 @@ class Recovery:
             if row['continuation']:
                 return {'id': row['continuation'], 'parent_operation': operation, 'evidence_id': evidence_id}
         self._quiescent()
-        if self.fingerprint() != proof['source']:
+        if not same_source(self.fingerprint(), proof['source']):
             raise IntegrationError('CONTINUATION_SOURCE_CHANGED')
         cid = digest(encode([operation, attempt, 'maintenance-continuation']).encode())
         with self.owner.transaction(self.owner.epoch) as db:

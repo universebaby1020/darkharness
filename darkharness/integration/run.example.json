@@ -6,6 +6,7 @@
   "grant_id": "controller-recorded-rehearsal-grant",
   "model": "gpt-6-astra",
   "effort": "high",
+  "turn_timeout_s": 3600.0,
   "codex_command": ["codex", "app-server", "--listen", "stdio://"],
   "seats": [
     {"alias": "dh-coordinator", "display_name": "dh coordinator", "role": "coordinator", "participant_id": "replace-coordinator-id"},

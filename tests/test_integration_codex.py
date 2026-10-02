@@ -267,6 +267,13 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_contract_readiness_no_inference(self):
         result = await CodexRuntime(self.adapter).readiness()
         self.assertEqual(result["inference"], "NOT_PROBED")
+        self.assertEqual(result['effective_timeout_s'], self.adapter.config.turn_timeout_s)
+        for timeout, source in ((3600.0, 'USER_DEFAULT_3600'), (42.5, 'explicit_config')):
+            self.adapter.config = self.adapter.config.model_copy(update={'turn_timeout_s': timeout})
+            self.adapter.turn_timeout_source = source
+            ready = await CodexRuntime(self.adapter).readiness()
+            self.assertEqual(ready['effective_timeout_s'], timeout)
+            self.assertEqual(ready['timeout_source'], source)
         self.assertFalse(any(m == "turn/start" for m,p in self.client.requests))
 
     async def test_unsafe_config_fail_closed(self):

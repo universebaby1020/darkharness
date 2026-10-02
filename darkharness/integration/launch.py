@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -54,11 +55,11 @@ def validate_config(config):
         raise IntegrationError("RUNTIME_SELECTION_REQUIRED")
     if type(config.get('auto_recover_settled_timeouts', False)) is not bool:
         raise IntegrationError('AUTO_RECOVERY_POLICY_INVALID')
-    timeout = config.get("turn_timeout_s", 180.0)
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
+    timeout = config.get("turn_timeout_s", 3600.0)
+    if type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout <= 0:
         raise IntegrationError("TIMEOUT_INVALID")
     return {"valid": True, "seats": 3, "credentials": "NOT_READ", "live": "NOT_STARTED", "effective_timeout_s": timeout,
-            "timeout_source": "explicit_config" if "turn_timeout_s" in config else "SDK4_DEFAULT_NOT_MEASURED"}
+            "timeout_source": "explicit_config" if "turn_timeout_s" in config else "USER_DEFAULT_3600"}
 
 
 def prepare(config, official_root, python="python3"):
@@ -144,7 +145,7 @@ class SeatManager:
                        sandbox="workspace-write", approval_policy="on-request", approval_mode="manual",
                        system_prompt=text, include_base_instructions=False, enable_self_config_tools=False,
                        codex_command=tuple(config["codex_command"]), codex_env=env,
-                       turn_timeout_s=config.get("turn_timeout_s", 180.0),
+                       turn_timeout_s=config.get("turn_timeout_s", 3600.0),
                        inject_history_on_resume_failure=False, emit_turn_lifecycle_events=True,
                        emit_diff_events=True, emit_token_usage_events=True)
                 adapter = DurableCodexAdapter(mailbox=self.mailbox, router=router, guard=guard,
@@ -152,6 +153,7 @@ class SeatManager:
                      workspace=config["workspace"], coordinator_id=coordinator, config=sdk_config,
                      receipt_run_resolver=execution_ledger_run,
                      auto_recover_settled_timeouts=config.get('auto_recover_settled_timeouts', False))
+                adapter.turn_timeout_source = "explicit_config" if "turn_timeout_s" in config else "USER_DEFAULT_3600"
                 adapter.startup_binding_pending = True
                 adapter.recovery_idle_client_pids = self.idle_client_pids
                 binding = RuntimeBinding("codex", "0.159.3", config["workspace"], "workspace-write", "on-request",

@@ -182,6 +182,23 @@ class IntegrationSession(Session):
             if adapter is not None:
                 result['wake_job_id'] = service.submit(manager.wake_continuation(result['id']))
             return self.response(req, data=result)
+        if action == 'integration.verification.reconcile_preflight':
+            if set(payload) != {'attempt', 'grant_id', 'effect_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            from .verification_bridge import VerificationBridge
+            from .preflight_recovery import reconcile_preflight
+            from .artifacts import SecretGuard
+            from .legacy_git_origin import execution_ledger_run
+            recovery = service.recovery(req['operation_id'], payload['grant_id'])
+            guard = SecretGuard.official(manager.official_root, manager.python)
+            bridge = VerificationBridge(manager.mailbox, recovery.router, guard, receipt_run_resolver=execution_ledger_run)
+            try:
+                result = reconcile_preflight(bridge, recovery, req['operation_id'], payload['attempt'], payload['effect_id'])
+            finally:
+                bridge.broker.close()
+            if result.get('id') and manager.agents:
+                result['wake_job_id'] = service.submit(manager.wake_continuation(result['id']))
+            return self.response(req, data=result)
         if action == 'integration.git.reconcile':
             if set(payload) != {'attempt', 'grant_id', 'effect_id'}:
                 raise Rejected('INVALID_RECOVERY_PAYLOAD')

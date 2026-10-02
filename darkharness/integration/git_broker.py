@@ -266,7 +266,7 @@ class LocalGitBroker:
                 candidate = {'state': 'COMMITTED', 'repo': str(self.root), 'git_identity': identity, 'ref': ref, 'parent': oldhead, 'commit': commit, 'tree': tree, 'paths': paths}
                 with self.owner.transaction(self.owner.epoch) as db:
                     self._authorize(db, operation, attempt, 'local_git_write')
-                    candidate.update(index_before=digest(index_before), index_after=Mailbox.artifact(db, index_after))
+                    candidate.update(index_before=Mailbox.artifact(db, index_before), index_after=Mailbox.artifact(db, index_after))
                     db.execute('UPDATE c_git_effect SET candidate=? WHERE id=?', (encode(candidate), identifier))
                     Mailbox.event(db, operation, 'LOCAL_GIT_CANDIDATE', {'attempt': attempt, 'id': identifier, 'candidate': candidate})
                 if self._identity(cwd) != identity or self._head() != (ref, oldhead) or self._index_bytes() != index_before or any(regular_path(self.root, p).read_bytes() != raw for p, raw, mode in files):

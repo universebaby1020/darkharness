@@ -59,6 +59,53 @@ class TimeoutTests(unittest.TestCase):
         fn(body['data'])
         self.owner.db.execute('UPDATE c_event SET body=? WHERE seq=?', (encode(body), row['seq']))
 
+    def test_late_native_terminal_and_prior_settled_reply(self):
+        self.evidence()
+        self.mutate('TURN_OUTCOME', lambda b: b.update(settled_reply=True))
+        db = self.owner.db
+        terminal = db.execute("SELECT seq FROM c_event WHERE kind='STDOUT_RPC' AND body LIKE '%turn/completed%'").fetchone()[0]
+        outcome = db.execute("SELECT seq FROM c_event WHERE kind='TURN_OUTCOME'").fetchone()[0]
+        db.execute('UPDATE c_event SET seq=-1 WHERE seq=?', (terminal,))
+        db.execute('UPDATE c_event SET seq=? WHERE seq=?', (terminal, outcome))
+        db.execute('UPDATE c_event SET seq=? WHERE seq=-1', (outcome,))
+        child = self.recovery.recover(self.op, 'a')
+        self.assertEqual(child, self.recovery.recover(self.op, 'a'))
+        self.assertEqual(json.loads(self.box.read_work(self.op)['result'])['acceptance'], 'NOT_EVALUATED')
+
+    def test_statcache_refresh_between_real_commits(self):
+        first = self.commit('first')
+        os.utime(self.root / 'first', None)
+        subprocess.run(['git', '-C', str(self.root), 'status', '--porcelain'], check=True, capture_output=True, timeout=5)
+        second = self.commit('second')
+        self.assertNotEqual(first['index_after'], second['index_before'])
+        os.utime(self.root / 'second', None)
+        subprocess.run(['git', '-C', str(self.root), 'status', '--porcelain'], check=True, capture_output=True, timeout=5)
+        self.evidence()
+        self.assertTrue(self.recovery.recover(self.op, 'a')['id'])
+
+    def test_index_semantics_v4_and_malformed_stage_evidence(self):
+        from darkharness.integration.index_evidence import indexed_entries, tree_entries
+        import hashlib
+        self.commit('first')
+        subprocess.run(['git', '-C', str(self.root), 'update-index', '--index-version=4'], check=True, timeout=5)
+        raw = self.broker._index_bytes()
+        self.assertEqual(indexed_entries(raw), tree_entries(self.broker, self.broker._head()[1]))
+        malformed = bytearray(raw[:-20])
+        malformed[72] |= 0x10  # nonzero stage flag in first entry
+        malformed += hashlib.sha1(malformed).digest()
+        with self.assertRaisesRegex(IntegrationError, 'INDEX_UNSAFE'):
+            indexed_entries(bytes(malformed))
+        with self.assertRaisesRegex(IntegrationError, 'INDEX_UNSAFE'):
+            indexed_entries(raw[:-1] + b'x')
+
+    def test_real_staged_change_still_blocks(self):
+        self.commit('first')
+        (self.root / 'first').write_text('staged changed content')
+        subprocess.run(['git', '-C', str(self.root), 'add', 'first'], check=True, timeout=5)
+        self.evidence()
+        with self.assertRaises(IntegrationError):
+            self.recovery.recover(self.op, 'a')
+
     def test_two_real_commits_timeout_continues_once_full_task_thread(self):
         first, latest = self.commit('first'), self.commit('second')
         self.evidence()

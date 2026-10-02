@@ -42,7 +42,7 @@ class VerificationTests(unittest.TestCase):
             self.git(p, 'init', '-q', '-b', 'main')
         (self.repo / 'base').write_text('base')
         self.commit(self.repo)
-        (self.source / 'check.py').write_text('import os,sys,time,json\nfrom pathlib import Path\ncheckout,out,mode=sys.argv[1:]\nout=Path(out)\nprint(checkout,flush=True)\nprint("stderr captured",file=sys.stderr,flush=True)\nassert "UNRELATED_FIXTURE" not in os.environ\nif mode=="sleep": time.sleep(20)\nif mode=="large": print("x"*200000)\n(out/"report.json").write_text(json.dumps({"accepted":mode!="reject"}))\nsys.exit(7 if mode=="fail" else 0)\n')
+        (self.source / 'check.py').write_text('import os,sys,time,json\nfrom pathlib import Path\ncheckout,out,mode=sys.argv[1:]\nout=Path(out)\nout.mkdir(mode=0o700,exist_ok=True)\nprint(checkout,flush=True)\nprint("stderr captured",file=sys.stderr,flush=True)\nassert "UNRELATED_FIXTURE" not in os.environ\nif mode=="sleep": time.sleep(20)\nif mode=="large": print("x"*200000)\n(out/"report.json").write_text(json.dumps({"accepted":mode!="reject"}))\nsys.exit(7 if mode=="fail" else 0)\n')
         self.commit(self.source)
         self.owner = LockedOwner()
         self.box = Mailbox(self.owner)
@@ -97,6 +97,39 @@ class VerificationTests(unittest.TestCase):
     def mode(self, mode):
         self.cfg['argv'][-1] = mode
         self.publish()
+
+    def test_checker_owns_fresh_report_directory(self):
+        from darkharness.integration.report_criteria import JsonReportCriteria
+        p = self.source / 'check.py'
+        p.write_text('import sys,json,subprocess\nfrom pathlib import Path\ncheckout,out,mode=sys.argv[1:]\nout=Path(out)\nassert not out.exists(), "precreated output"\nout.mkdir(mode=0o700)\nrevision=subprocess.check_output(["/usr/bin/git","-C",checkout,"rev-parse","HEAD"]).decode().strip()\nreport={"revision":revision if mode!="wrong" else "b"*40,"collected":0 if mode=="zero" else 1,"passed":1}\n(out/"report.json").write_text(json.dumps(report))\nprint("private fixture stdout")\n')
+        self.commit(self.source)
+        self.cfg.update(source_head=self.git(self.source, 'rev-parse', 'HEAD').strip(), source_tree=self.git(self.source, 'rev-parse', 'HEAD^{tree}').strip(), output_layout='checker-owned-v1', report_criteria=[{'file': 'report.json', 'revision_path': ['revision'], 'positive': [['collected']], 'equal_paths': [{'left': ['passed'], 'right': ['collected']}]}])
+        self.broker.parsers['json-v1'] = JsonReportCriteria()
+        self.publish()
+        self.start()
+        result = self.wait()
+        self.assertEqual(result['state'], 'SUCCEEDED')
+        self.assertEqual(json.loads((Path(result['output']) / 'report.json').read_text())['revision'], self.revision)
+        self.assertNotEqual(Path(result['artifacts']['stdout']['path']).parent, Path(result['output']))
+        for mode in ('zero', 'wrong'):
+            self.mode(mode)
+            self.start(mode)
+            rejected = self.wait(mode)
+            self.assertEqual(rejected['state'], 'FAILED')
+            self.assertEqual(rejected['reason'], 'DECLARED_REPORT_REJECTED')
+            self.assertFalse(rejected['accepted'])
+
+    def test_nonzero_missing_report_is_known_process_failure(self):
+        p = self.source / 'check.py'
+        p.write_text('import sys\nsys.exit(2)\n')
+        self.commit(self.source)
+        self.cfg.update(source_head=self.git(self.source, 'rev-parse', 'HEAD').strip(), source_tree=self.git(self.source, 'rev-parse', 'HEAD^{tree}').strip())
+        self.publish()
+        self.start()
+        result = self.wait()
+        self.assertEqual(result['state'], 'FAILED')
+        self.assertEqual(result['exit_code'], 2)
+        self.assertFalse(result['accepted'])
 
     def test_automatic_receipt_resolution_and_returned_receipt_selector(self):
         with self.owner.transaction(self.owner.epoch) as db:

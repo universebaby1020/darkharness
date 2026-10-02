@@ -39,7 +39,7 @@ def _terminal_evidence(db, parent, router):
     outcome = one('TURN_OUTCOME', lambda b: b.get('thread_id') == thread and b.get('turn_id') == turn and b.get('room_id') == router.room)
     error = outcome[1].get('turn_error') or ''
     match = re.fullmatch(r'Codex turn timed out after ([0-9]+(?:\.[0-9]+)?)s', error)
-    if not match or float(match[1]) <= 0 or outcome[1].get('turn_status') != 'failed' or outcome[1].get('settled_reply') is not False:
+    if not match or float(match[1]) <= 0 or outcome[1].get('turn_status') != 'failed' or type(outcome[1].get('settled_reply')) is not bool:
         raise IntegrationError('NOT_SDK_TURN_TIMEOUT')
     runtime = one('RUNTIME_ERROR', lambda b: b.get('code') == 'TurnResultAlreadyReported' and b.get('diagnostic') == error)
     interrupted = one('STDOUT_RPC', lambda b: b.get('payload', {}).get('method') == 'turn/completed' and b['payload'].get('params', {}).get('threadId') == thread and b['payload']['params'].get('turn', {}).get('id') == turn)
@@ -70,9 +70,16 @@ def _terminal_evidence(db, parent, router):
             starts.append((r, data))
     if len(starts) != 1:
         raise IntegrationError('TIMEOUT_PROCESS_OWNERSHIP_UNKNOWN')
-    chain = [starts[0], start, accepted, interrupt, interrupted, outcome, runtime, stopped]
+    # SDK outcome and native interrupted notification are asynchronous. Both
+    # must follow interrupt and precede runtime/cessation; ACK precedes outcome.
+    # Neither alone
+    # settles the task (settled_reply only describes a prior tool reply).
+    chain = [starts[0], start, accepted, interrupt]
     seq = [r['seq'] for r, _ in chain]
-    if seq != sorted(set(seq)) or not interrupt[0]['seq'] < ack[0]['seq'] < outcome[0]['seq']:
+    if (seq != sorted(set(seq)) or
+            not interrupt[0]['seq'] < ack[0]['seq'] < outcome[0]['seq'] or
+            not interrupt[0]['seq'] < interrupted[0]['seq'] or
+            not max(interrupted[0]['seq'], outcome[0]['seq']) < runtime[0]['seq'] < stopped[0]['seq']):
         raise IntegrationError('TIMEOUT_EVIDENCE_ORDER')
     owned = db.execute('SELECT 1 FROM c_owned_thread WHERE thread=? AND run_id=? AND seat=? AND room=?', (thread, router.run_id, router.seat, router.room)).fetchone()
     if not owned:
@@ -121,7 +128,7 @@ def _terminal_evidence(db, parent, router):
     if pending or callbacks:
         raise IntegrationError('TIMEOUT_ITEM_UNSETTLED')
     refs = []
-    for r, _ in chain + [ack]:
+    for r, _ in chain + [ack, interrupted, outcome, runtime, stopped]:
         ref = Mailbox.artifact(db, r['body'].encode())
         refs.append({'seq': r['seq'], 'artifact_id': ref})
     return {'classification': 'SETTLED_SDK_TURN_TIMEOUT', 'thread': thread, 'turn': turn, 'client_id': client,
