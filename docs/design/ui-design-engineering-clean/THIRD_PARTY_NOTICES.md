@@ -12,7 +12,7 @@
 
 라이선스 사본은 원본 바이트를 유지했다. Apache 파생 browser 문서에는 수정 사실을 표시한다. 이전 원천 검사에서 해당 pinned Playwright CLI 트리의 별도 NOTICE가 확인되지 않았으나, 나중에 실제 설치하는 패키지/부속 의존물의 고지까지 대체하지 않는다.
 
-제3자 내용 전체를 프로젝트 MIT로 재표기하지 않는다. 사용자의 공통규범과 새 작성 문서는 사용자 요청에 따른 작업물이며, 이 파일로 사용자 원문의 저작권자·배포조건을 새로 발명하지 않는다. 외부 도구 바이너리·이미지·폰트·원작 코드 전체는 동봉하지 않았다.
+제3자 내용 전체를 프로젝트 MIT로 재표기하지 않는다. C7=1: SKILL.md, governance/*, references/motion.md, references/layout-and-state.md, SOURCES_AND_SCOPE.md의 원 작성 문안은 이 repo의 MIT LICENSE를 따른다. 보존된 제3자 부분의 라이선스는 바꾸지 않는다. 외부 도구 바이너리·이미지·폰트·원작 코드 전체는 동봉하지 않았다.
 
 ## Original authored files — C7=1
 

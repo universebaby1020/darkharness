@@ -7,6 +7,12 @@ Directory-level mappings use /* honestly; no sentence-level audit is claimed.
 import argparse
 import hashlib
 import json
+import os
+
+if __package__:
+    from .public_guard import load_private
+else:
+    from public_guard import load_private
 from pathlib import Path
 import shutil
 
@@ -27,12 +33,29 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def substitute(text, pairs):
+    """Apply private literal pairs; absent source is a changed input, not success."""
+    for pair in pairs:
+        if pair['source'] not in text:
+            raise ValueError('PUBLICATION_SOURCE_LITERAL_MISSING')
+        text = text.replace(pair['source'], pair['replacement'])
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', type=Path, required=True)
+    parser.add_argument('--private-config', type=Path, default=os.environ.get('DH_PUBLIC_PRIVATE_CONFIG'))
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
+    try:
+        private = load_private(args.private_config, repo)
+    except (OSError, ValueError, UnicodeError):
+        parser.exit(2, 'PUBLICATION_PRIVATE_CONFIG_INVALID: values suppressed\n')
     src = args.package / 'design_pack/ui-design-engineering-clean'
+    # Validate the exact substitution inputs before writing any publication file.
+    sanitized = {rel: substitute((src / rel).read_text(encoding='utf-8'), pairs)
+                 for rel, pairs in private['design_pack_replacements'].items()}
     dest = repo / PACK_REL
     evidence = repo / EVIDENCE_REL
     if dest.exists():
@@ -50,6 +73,10 @@ def main():
     inventory = (args.package / 'provenance/INPUT_AND_DISPOSITION.json').read_bytes()
     assert len(json.loads(inventory)['files']) == 147
     shutil.copytree(src, dest)
+    # Match published Git text blobs on every host; license bytes stay untouched.
+    for p in dest.rglob('*'):
+        if p.is_file() and 'licenses' not in p.relative_to(dest).parts:
+            p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n'))
     # Before any staging: protect exact license bytes, including CRLF Apache file.
     attrs = repo / '.gitattributes'
     old = attrs.read_text(encoding='utf-8') if attrs.exists() else ''
@@ -71,11 +98,13 @@ def main():
     (dest / 'FILE_SOURCE_MAP.json').write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + '\n', encoding='utf-8', newline='\n')
     notices = dest / 'THIRD_PARTY_NOTICES.md'
     text = notices.read_text(encoding='utf-8')
-    text = text.replace('`ui-design-engineering-v2(2).zip`', '선별 UI 설계 입력 묶음').replace('Jakub Krehel / make-interfaces-feel-better', 'Jakub Krehel / jakubkrehel/make-interfaces-feel-better')
+    text = sanitized['THIRD_PARTY_NOTICES.md']
+    text = text.replace('사용자의 공통규범과 새 작성 문서는 사용자 요청에 따른 작업물이며, 이 파일로 사용자 원문의 저작권자·배포조건을 새로 발명하지 않는다.',
+                        'C7=1: SKILL.md, governance/*, references/motion.md, references/layout-and-state.md, SOURCES_AND_SCOPE.md의 원 작성 문안은 이 repo의 MIT LICENSE를 따른다. 보존된 제3자 부분의 라이선스는 바꾸지 않는다.')
     text += '\n## Original authored files — C7=1\n\nThe original authored wording in ' + ORIGINALS + ' follows the repository MIT LICENSE. Retained third-party portions remain under their upstream licenses; the repository MIT grant does not replace them. references/browser-verification.md is an Apache-2.0 derivative with modifications dated 2026-10-02. The supplied pinned-tree inspection found no upstream NOTICE. This is not legal clearance. Upstream paths and commits are in FILE_SOURCE_MAP.json.\n'
     notices.write_text(text, encoding='utf-8', newline='\n')
     scope = dest / 'governance/COMMON_GUIDANCE_SCOPE_KO.md'
-    text = scope.read_text(encoding='utf-8').replace('`공통설계지침_LITE(5).md`', '사용자 공통 작업 지침').replace('Binance Spot LIVE/seal이라는', '별도 프로젝트의 운영에 관한')
+    text = sanitized['governance/COMMON_GUIDANCE_SCOPE_KO.md']
     scope.write_text(text, encoding='utf-8', newline='\n')
     root_notice = repo / 'THIRD_PARTY_NOTICES.md'
     text = root_notice.read_text(encoding='utf-8')

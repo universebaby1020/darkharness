@@ -6,7 +6,7 @@ Claude Code는 실제 protected factory/SDK component 경로가 있으나 실제
 qualification은 NOT_RUN이다. 과거 repair 범위의 fixed-runtime 설명은 후속 run의
 사용자 선택을 제한하지 않는다. optional imports는 Codex-only 환경에서 lazy다.
 
-This integration extends the installed `band.adapters.codex.CodexAdapter`; it does not replace the SDK or patch installed files. `DurableCodexAdapter` uses the inherited turn runner and RPC/event plumbing. `contract.py` defines the provider-independent interface. Compatibility is pinned to SDK **4.0.0**; private hooks below require revalidation before upgrading.
+This integration extends the installed `band.adapters.codex.CodexAdapter`; it does not replace the SDK or patch installed files. `DurableCodexAdapter` uses the inherited turn runner and RPC/event plumbing. `contract.py` defines a shared facade, not a guarantee of provider-independent lifecycle or recovery. The current main still has Codex-specific seams. The adapter-boundary work is an unmerged experimental branch; its component tests do not establish live provider qualification. Compatibility is pinned to SDK **4.0.0**; private hooks below require revalidation before upgrading.
 
 ## Inspected upstream hooks
 
@@ -75,7 +75,7 @@ Focused Linux regression command:
 python -B -m unittest discover -s tests -p 'test_integration_*.py' -v
 ```
 
-The current focused result and source hashes are recorded in `dev-evidence/WO-DH0-01R3/worker-repair/RESULT_KO.md`. Tests are components using installed SDK4 and isolated actual Linux Git/processes, not provider inference or Band traffic. Actual runtime and Band operations remain Main-owned.
+Historical focused results and source hashes are kept in operator-private evidence outside this repository, not shipped as a public checkout link. Tests are components using installed SDK4 and isolated actual Linux Git/processes, not provider inference or Band traffic. Actual runtime and Band operations remain Main-owned.
 
 ## WO-DH0-01R3 로컬 Git와 유지보수 재개
 

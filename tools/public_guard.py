@@ -4,6 +4,24 @@ Official credential shapes: dark-factory harness/check.py revision 803560d2a678.
 This is an independent guard, not the contest layout checker.
 """
 import argparse
+import hashlib
+
+# Only mandatory attribution in these exact, verified upstream license blobs
+# can exempt an account-handle match. No name, email, UUID or path exemption.
+LICENSE_BLOBS = {
+    'docs/design/ui-design-engineering-clean/licenses/emil-design-eng-LICENSE': '4ff5bdb7887ec1435c9cab0e8d1a7caee704d894d65c2a008ccc68b1cc2f260b',
+    'docs/design/ui-design-engineering-clean/licenses/fixing-accessibility-LICENSE': 'c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b',
+    'docs/design/ui-design-engineering-clean/licenses/make-interfaces-feel-better-LICENSE': 'ed1dfe988fc40511b4845ccd9050a143a2002fee3bedc8064c47fa342b5d8d4f',
+    'docs/design/ui-design-engineering-clean/licenses/playwright-cli-LICENSE': '9a7110fc2d2f964038e5dc49128f908f29f47a574c961cba16085914e879cbda',
+    'docs/design/ui-design-engineering-clean/licenses/shadcn-LICENSE.md': '1564074e13439397221ffd522e2e504d56561994a23d371aa5e3ad43e4f5423f',
+}
+PRIVATE_TYPES = {
+    'account_handles': 'account-handle', 'band_uuids': 'real-band-uuid',
+    'project_names': 'private-project-name', 'local_filenames': 'local-filename',
+    'account_emails': 'account-email', 'account_display_names': 'account-display-name',
+    'development_participant_ids': 'development-participant-id',
+}
+REPLACEMENT_FILES = {'THIRD_PARTY_NOTICES.md', 'governance/COMMON_GUIDANCE_SCOPE_KO.md'}
 from pathlib import Path, PurePosixPath
 import json
 import os
@@ -19,8 +37,9 @@ SHAPES = {
     "env-assignment": r"(?i)\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*=\s*\S+",
     "url-credentials": r'''(?<=://)[^/\s:@"'\\]+:[^/\s@"'\\]+(?=@)''',
     "band-key": r'''(?i)\b(?:band[_-]?(?:agent[_-]?)?key|agent[_-]key)\s*[:=]\s*["']?[A-Za-z0-9._-]{16,}''',
-    "private-windows-path": r"(?i)[a-z]:[\\/]+Users[\\/]+[A-Za-z0-9_.-]+[\\/]",
-    "private-linux-path": r"/home/[A-Za-z0-9_.-]+/",
+    "private-windows-path": r"(?i)[a-z]:[\\/]+Users[\\/]+[^\\/\s\"'<>]+[\\/]",
+    "private-linux-path": r"/" + r"home/[^/\s\"'<>]+/",
+    "private-wsl-windows-path": r"(?i)/mnt/[a-z]/Users/[^/\s\"'<>]+/",
 }
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 CONFIG_NAMES = {"Dockerfile", "Makefile", ".envrc"}
@@ -41,7 +60,7 @@ def findings(path, data):
             reasons.append(name)
     for match in EMAIL.findall(text):
         domain = match.rsplit("@", 1)[1].lower()
-        if not domain.endswith(".invalid") and domain != "users.noreply.github.com":
+        if not domain.endswith(".invalid"):
             reasons.append("personal-email")
             break
     return reasons
@@ -58,21 +77,41 @@ def load_private(path, repo):
     path, repo = Path(path).resolve(), Path(repo).resolve()
     if path.is_relative_to(repo):
         raise ValueError('PRIVATE_CONFIG_OUTSIDE_REPO_REQUIRED')
-    config = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(config, dict) or set(config) != {'schema_version', 'account_handles', 'band_uuids'} or config['schema_version'] != 'darkharness-publication-private-1':
+    raw = path.read_bytes()
+    config = json.loads(raw.decode('utf-8'))
+    required = {'schema_version', 'design_pack_replacements', *PRIVATE_TYPES}
+    if not isinstance(config, dict) or set(config) != required or config['schema_version'] != 'darkharness-publication-private-2':
         raise ValueError('PRIVATE_CONFIG_SCHEMA_INVALID')
-    for key in ('account_handles', 'band_uuids'):
-        if not isinstance(config[key], list) or not config[key] or not all(isinstance(v, str) and v.strip() == v and v and '\n' not in v and '\r' not in v for v in config[key]):
+    def literal(v):
+        return isinstance(v, str) and v.strip() == v and bool(v) and not any(c in v for c in ('\n', '\r', '\0'))
+    for key in PRIVATE_TYPES:
+        if not isinstance(config[key], list) or not all(literal(v) for v in config[key]):
             raise ValueError('PRIVATE_CONFIG_VALUES_REQUIRED')
-    if not all(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', v) for v in config['band_uuids']):
-        raise ValueError('PRIVATE_CONFIG_UUID_INVALID')
+        if not config[key]:
+            raise ValueError('PRIVATE_CONFIG_VALUES_REQUIRED')
+    for key in ('band_uuids', 'development_participant_ids'):
+        if not all(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', v) for v in config[key]):
+            raise ValueError('PRIVATE_CONFIG_UUID_INVALID')
+    pairs = config['design_pack_replacements']
+    if not isinstance(pairs, dict) or set(pairs) != REPLACEMENT_FILES:
+        raise ValueError('PRIVATE_REPLACEMENTS_REQUIRED')
+    for values in pairs.values():
+        if not isinstance(values, list) or not values or not all(isinstance(v, dict) and set(v) == {'source', 'replacement'} and literal(v['source']) and literal(v['replacement']) and v['source'] != v['replacement'] for v in values):
+            raise ValueError('PRIVATE_REPLACEMENTS_INVALID')
+    sources = {v['source'] for values in pairs.values() for v in values}
+    if not set(config['project_names'] + config['local_filenames']) <= sources:
+        raise ValueError('PRIVATE_REPLACEMENTS_INCOMPLETE')
+    if any(value in pair['replacement'] for values in pairs.values() for pair in values for key in PRIVATE_TYPES for value in config[key]):
+        raise ValueError('PRIVATE_REPLACEMENT_EXPOSURE')
+    # Hash the exact bytes that were parsed; do not reread a mutable file later.
+    config['_sha256'] = hashlib.sha256(raw).hexdigest()
     return config
 
 
 def safe_path(path, private):
     text = path
-    for values in (private.get('account_handles', []), private.get('band_uuids', [])):
-        for value in values:
+    for key in PRIVATE_TYPES:
+        for value in private.get(key, []):
             text = text.replace(value, '[REDACTED]')
     for expression in SHAPES.values():
         text = re.sub(expression, '[REDACTED]', text)
@@ -82,9 +121,12 @@ def safe_path(path, private):
 def records(path, data, private, commit='INDEX'):
     rows = []
     text = data.decode('utf-8', errors='replace')
+    attribution = LICENSE_BLOBS.get(path) == hashlib.sha256(data).hexdigest()
     for number, line in enumerate(text.splitlines(), 1):
         reasons = findings(path, line.encode('utf-8'))
-        for key, reason in (('account_handles', 'account-handle'), ('band_uuids', 'real-band-uuid')):
+        for key, reason in PRIVATE_TYPES.items():
+            if key == 'account_handles' and attribution:
+                continue
             if any(value in line for value in private.get(key, [])):
                 reasons.append(reason)
         for reason in dict.fromkeys(reasons):
@@ -174,7 +216,11 @@ def main():
             for field in ('AUTHOR', 'COMMITTER'):
                 rows.extend(records('<' + field.lower() + '>', git('var', 'GIT_' + field + '_IDENT'), private))
             rows.extend(records('<commit-message>', args.message_file.read_bytes(), private))
-        print(json.dumps({'status': 'EXPOSURE_RECORD_ONLY' if args.published_history else ('PUBLIC_GUARD_DENY' if rows else 'PUBLIC_GUARD_PASS'), 'findings': rows}, indent=2))
+        print(json.dumps({'status': 'EXPOSURE_RECORD_ONLY' if args.published_history else ('PUBLIC_GUARD_DENY' if rows else 'PUBLIC_GUARD_PASS'),
+                          'guard_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                          'private_config_sha256': private.get('_sha256'),
+                          'private_counts': {key: len(private.get(key, [])) for key in PRIVATE_TYPES},
+                          'findings': rows}, indent=2))
         return 0 if args.published_history else int(bool(rows))
     except (OSError, ValueError, subprocess.SubprocessError):
         print('PUBLIC_GUARD_ERROR: configuration or Git input invalid; values suppressed')

@@ -42,7 +42,7 @@ Main이 이미 사용자 로컬의 `<USER_LOCAL_AXE_DIR>`에 고정 axe-core 4.1
 
 ## Main 실제 controller 시험
 
-정확한 준비 명령은 `evidence/wo-dh0-02r3-uiqa/API_HANDOFF.md`에 있다. Main만 source commit/freeze/direct clone과 실제 Docker 시험을 실행한다. 이 worker는 fake component tests만 실행한다.
+준비·재시험 기록은 repo 밖의 비공개 운영자 evidence에 보관하며 공개 checkout에 동봉하지 않는다. 실행 계약은 위 Controller 등록 절과 [controller 소스](../tools/uiqa/controller.py)를 따른다. Main만 source commit/freeze/direct clone과 실제 Docker 시험을 실행한다. 기존 worker 검사는 fake component 수준이다.
 
 `run_controller_tests.py`는 기존 완료 result를 read-only input으로 읽고 별도 사본에서만 fixture flow/음성 control을 commit한다. real LocalGitBroker origin + independent snapshot → real VerificationBridge/Broker subprocess → guarded read + continuation 1회 + UNKNOWN fence 부재를 검사한다. in-memory serialized owner는 fixture이며 live room/SDK/model 시험이 아니다. 실제 Docker/브라우저는 모형이 아니다.
 
@@ -70,7 +70,7 @@ python3 -B tools/uiqa/cleanup_owned.py EFFECT_ID NEW_PRIVATE_CLEANUP_DIRECTORY
 
 ERROR report와 private `host-diagnostic.json`/`browser-diagnostic.json`에는 고정된 phase와 허용된 exception class만 남긴다. 예외 문자열·DOM·URL·원문 stack은 보고하지 않는다. 양성 실행의 옛 예외가 삭제되어 사후 확정되지 않는 한계를 보존한다. 이미지 읽기 전용 검사에서 root-local browser 설치와 0700 `/root`를 확인했으나 repaired runtime 성공은 Main의 새 여섯 case로 판단한다.
 
-새 freeze/재시험 명령은 `evidence/wo-dh0-02r3-uiqa/repair/API_HANDOFF.md`에 있다. 기존 첫-pass evidence·147개 표·UIQ-T01..T36·영어 addendum은 변경하지 않았다.
+새 freeze/재시험 기록은 비공개 운영자 evidence에만 있으며 공개 checkout의 재현 근거로 간주하지 않는다. 기존 첫-pass evidence·147개 표·UIQ-T01..T36·영어 addendum은 변경하지 않았다.
 
 Startup 음성 시험은 generic ERROR만으로 인정하지 않는다. 앱의 curated running/status/exit_code(health 로그 제외)를 시작 직후와 브라우저 종료 뒤에 관측한다. `/bin/false` 주입의 exited/exit1과 app_startup_state 또는 navigation 실패를 함께 요구한다. tool_import/browser_launch/axe_scan 오류는 startup 주입의 증거로 세지 않는다. missing axe는 axe_validation/FileNotFoundError, 주입 control은 COMPLETED/exit0와 실제 해당 finding을 요구한다. 관측은 단일 daemon 조회이며 새 retry/timeout/readiness 정책을 넣지 않는다. 최초 Main raw pass boolean은 변경하지 않는다.
 
@@ -80,4 +80,4 @@ Main이 전달한 `UIQA_BROWSER_NATIVE_DIAGNOSTIC.json`과 `UIQA_SCRATCH_OWNER_D
 
 `browser_worker.main()`은 `/scratch`의 링크(ancestor 포함)·특수 inode·하드링크를 소유권 변경/진단 쓰기 전에 거절한다. 부분 handoff 실패, flow 실패, 진단 쓰기 실패에도 소유권 반환을 시도하며, 반환 검증/변경 실패는 성공 종료가 아니다. 새로운 mount/image/user/HOME/capability/security/timeout/routing 변경은 없고 trace/axe 검사도 유지한다. SIGKILL에서 `finally` 실행과 소유권 반환은 보장되지 않으므로 기존 STOP PARTIAL 및 선언 보고서 no-fake 규칙은 그대로다.
 
-Linux fake 집중 시험, 고정 source/tests/docs 해시 및 Main 재시험 handoff는 `evidence/wo-dh0-02r3-uiqa-scratch-owner/`에 둔다. 소유권 syscall은 모형이며 DrvFS의 FIFO 미지원 때문에 특수 inode type도 모형으로 검사한다. 실제 Docker 여섯 case·full suite·production seal은 여기서 주장하지 않는다.
+Linux fake 집중 시험, 고정 source/tests/docs 해시 및 Main 재시험 handoff는 비공개 운영자 evidence에 보관하며 공개 repo에는 포함하지 않는다. 소유권 syscall은 모형이며 DrvFS의 FIFO 미지원 때문에 특수 inode type도 모형으로 검사한다. 실제 Docker 여섯 case·full suite·production seal은 여기서 주장하지 않는다.
