@@ -1,0 +1,103 @@
+{
+  "revision": "3-rights-pruned-r1",
+  "retained_reference_sources": {
+    "visual-craft.md": [
+      "make-interfaces-feel-better",
+      "emil-design-eng",
+      "shadcn"
+    ],
+    "accessibility.md": [
+      "fixing-accessibility",
+      "emil-design-eng"
+    ],
+    "browser-verification.md": [
+      "playwright-cli"
+    ],
+    "shadcn.md": [
+      "shadcn"
+    ],
+    "motion.md": [
+      "emil-design-eng"
+    ]
+  },
+  "rewritten_files": {
+    "SKILL.md": "current user constraints plus retained licensed UI guidance; not old mixed file copy",
+    "references/motion.md": "old mixed motion file excluded; general user-guidance wording newly authored",
+    "references/layout-and-state.md": "abstract concepts only; no original images/snippets/statistics/evaluations"
+  },
+  "license_sha256": {
+    "emil-design-eng-LICENSE": "4ff5bdb7887ec1435c9cab0e8d1a7caee704d894d65c2a008ccc68b1cc2f260b",
+    "make-interfaces-feel-better-LICENSE": "ed1dfe988fc40511b4845ccd9050a143a2002fee3bedc8064c47fa342b5d8d4f",
+    "fixing-accessibility-LICENSE": "c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b",
+    "playwright-cli-LICENSE": "9a7110fc2d2f964038e5dc49128f908f29f47a574c961cba16085914e879cbda",
+    "shadcn-LICENSE.md": "1564074e13439397221ffd522e2e504d56561994a23d371aa5e3ad43e4f5423f"
+  },
+  "excluded_original_archives_included": false,
+  "runtime_binaries_included": false,
+  "legal_clearance": "NOT_CLAIMED",
+  "upstream_sources": {
+    "emil-design-eng": {
+      "repository": "https://github.com/emilkowalski/skills",
+      "commit": "85e8e2363b713506e1d5b6e07a0eb2da66be1bc3",
+      "paths": [
+        "skills/emil-design-eng/SKILL.md"
+      ],
+      "copyright": "2026 Emil Kowalski",
+      "license": "MIT",
+      "license_file": "licenses/emil-design-eng-LICENSE",
+      "mapping_basis": "adopted WO section 2.2 and supplied foreman table; /* denotes directory-level scope, not exact sentence/file correspondence"
+    },
+    "make-interfaces-feel-better": {
+      "repository": "https://github.com/jakubkrehel/make-interfaces-feel-better",
+      "commit": "35545ea1512ad59fa463e6b1f95ca9c052981fe6",
+      "paths": [
+        "skills/make-interfaces-feel-better/*"
+      ],
+      "copyright": "2026 Jakub Krehel",
+      "license": "MIT",
+      "license_file": "licenses/make-interfaces-feel-better-LICENSE",
+      "mapping_basis": "adopted WO section 2.2 and supplied foreman table; /* denotes directory-level scope, not exact sentence/file correspondence"
+    },
+    "fixing-accessibility": {
+      "repository": "https://github.com/ibelick/ui-skills",
+      "commit": "b1cc8e0073ac64b09b3d38cd604407aa20c2b7ad",
+      "paths": [
+        "skills/fixing-accessibility/SKILL.md"
+      ],
+      "copyright": "2026 Julien Thibeaut",
+      "license": "MIT",
+      "license_file": "licenses/fixing-accessibility-LICENSE",
+      "mapping_basis": "adopted WO section 2.2 and supplied foreman table; /* denotes directory-level scope, not exact sentence/file correspondence"
+    },
+    "playwright-cli": {
+      "repository": "https://github.com/microsoft/playwright-cli",
+      "commit": "74354ecc7a43da16d91a9bc54fa8db8283a3fcf5",
+      "paths": [
+        "skills/playwright-cli/*"
+      ],
+      "copyright": "Microsoft Corporation (upstream source attribution)",
+      "license": "Apache-2.0",
+      "license_file": "licenses/playwright-cli-LICENSE",
+      "mapping_basis": "adopted WO section 2.2 and supplied foreman table; /* denotes directory-level scope, not exact sentence/file correspondence"
+    },
+    "shadcn": {
+      "repository": "https://github.com/shadcn-ui/ui",
+      "commit": "98a1fe67b439324ddc857f47fbdce056600a4329",
+      "paths": [
+        "skills/shadcn/*"
+      ],
+      "copyright": "2023 shadcn",
+      "license": "MIT",
+      "license_file": "licenses/shadcn-LICENSE.md",
+      "mapping_basis": "adopted WO section 2.2 and supplied foreman table; /* denotes directory-level scope, not exact sentence/file correspondence"
+    }
+  },
+  "original_authored_files_mit": [
+    "SKILL.md",
+    "governance/*",
+    "references/motion.md",
+    "references/layout-and-state.md",
+    "SOURCES_AND_SCOPE.md"
+  ],
+  "publication_revision": "2026-10-02-c7-mit-hygiene"
+}
