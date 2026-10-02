@@ -15,7 +15,7 @@ class MandateHygieneTests(unittest.TestCase):
         for role in ('coordinator', 'builder', 'reviewer'):
             text = render_mandate('dh ' + role, role, 'DarkHarness (Band SDK Codex)', 'synthetic-model', 'high')
             self.assertIn('Harness: DarkHarness (Band SDK Codex)', text)
-            self.assertIn("The coordinator's final report ends this run.", text)
+            self.assertIn("The coordinator's final report ends the current dispatched task.", text)
             self.assertIn('unless reporting a concrete defect', text)
             self.assertIn('Do not start acknowledgement or confirmation loops.', text)
             self.assertIn('Never echo credential or token values in commands, outputs or messages', text)
