@@ -67,7 +67,7 @@ class FakeDocker:
 class CheckerTests(unittest.TestCase):
     def setUp(self):
         # All test-generated files stay within the owned evidence subtree.
-        area = Path(__file__).resolve().parents[1] / 'evidence/wo-dh0-02r3-uiqa/local-tests'
+        area = Path(__file__).resolve().parents[1] / 'evidence/wo-dh0-02r3-uiqa-navigation/local-tests'
         area.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=area)
         self.root = Path(self.temp.name)
@@ -114,6 +114,30 @@ class CheckerTests(unittest.TestCase):
         self.assertIn('--label', network)
         self.assertEqual(self.report()['effects'], {'docker': True, 'network': True})
         self.assertEqual(self.report()['visual_review'], 'NOT_PERFORMED')
+
+    def test_internal_service_alias_and_browser_origin_share_network(self):
+        from urllib.parse import urlsplit
+        for port in (8080, 8000, 65535):
+            with self.subTest(port=port):
+                self.args.port = port
+                self.out = self.root / f'output/reports-{port}'
+                self.args.output = str(self.out)
+                self.assertEqual(self.run_fake(), 0)
+                app = next(c for c in self.docker.calls if c[0] == 'run' and '-d' in c)
+                browser = next(c for c in self.docker.calls if c[0] == 'run' and '-d' not in c)
+                network = next(c for c in self.docker.calls if c[:2] == ('network', 'create'))
+                alias = app[app.index('--network-alias') + 1]
+                base = browser[browser.index('/scratch') + 1]
+                origin = urlsplit(base)
+                self.assertEqual(alias, 'service')
+                self.assertEqual(base, f'http://{alias}:{port}')
+                self.assertEqual((origin.scheme, origin.hostname, origin.port), ('http', alias, port))
+                self.assertEqual(app.count('--network-alias'), 1)
+                self.assertIn('--internal', network)
+                for run in (app, browser):
+                    self.assertEqual(run[run.index('--network') + 1], network[-1])
+                    for forbidden in ('--add-host', '--publish', '-p', '--publish-all', '-P'):
+                        self.assertNotIn(forbidden, run)
 
     def test_official_runner_identity_and_private_owner_handoff(self):
         self.run_fake()
@@ -363,6 +387,11 @@ class CheckerTests(unittest.TestCase):
     def test_browser_worker_fake_scan_and_increment_flow(self):
         from types import SimpleNamespace
         from browser_worker import run
+        # Consume the actual checker command's origin, not a parallel test URL.
+        self.assertEqual(self.run_fake(), 0)
+        browser_run = next(c for c in self.docker.calls if c[0] == 'run' and '-d' not in c)
+        base_url = browser_run[browser_run.index('/scratch') + 1]
+        self.assertEqual(base_url, 'http://service:8000')
         fixture = json.loads((UIQA / 'fixtures/toy-stage-2.flow.json').read_text())
         flow_path = self.root / 'browser-flow.json'
         flow_path.write_text(json.dumps(fixture))
@@ -376,7 +405,9 @@ class CheckerTests(unittest.TestCase):
             class Page:
                 def __init__(self): self.value = 0
                 def on(self, *args): pass
-                def goto(self, *args, **kw): pass
+                def goto(page, url, **kw):
+                    self.assertEqual(url, base_url + '/')
+                    self.assertEqual(kw, {'wait_until': 'load'})
                 def reload(self, **kw): pass
                 def locator(self, selector): return Locator(self, selector)
                 def add_script_tag(self, **kw): pass
@@ -400,7 +431,26 @@ class CheckerTests(unittest.TestCase):
             class Context:
                 def __init__(self): self.tracing = Trace()
                 def new_page(self): return Page()
-                def route(self, *args): pass
+                def route(context, pattern, handler):
+                    self.assertEqual(pattern, '**/*')
+                    # Exercise the unchanged production origin gate with fake requests.
+                    for url, allowed in ((base_url + '/asset.js', True),
+                                         ('data:text/plain,fixture', True),
+                                         ('blob:' + base_url + '/fixture', True),
+                                         ('about:blank', True),
+                                         ('http://app:8000/', False),
+                                         ('https://service:8000/', False),
+                                         ('http://service:8080/', False),
+                                         ('http://service.evil.invalid:8000/', False),
+                                         ('http://' + 'service:8000' + '@other.invalid/', False),
+                                         ('http://localhost:8000/', False),
+                                         ('http://other.invalid/', False)):
+                        decisions = []
+                        route = SimpleNamespace(request=SimpleNamespace(url=url),
+                                                continue_=lambda: decisions.append('continue'),
+                                                abort=lambda: decisions.append('abort'))
+                        handler(route)
+                        self.assertEqual(decisions, ['continue' if allowed else 'abort'], url)
                 def close(self): pass
             class Browser:
                 version = 'fake-chromium'
@@ -411,7 +461,7 @@ class CheckerTests(unittest.TestCase):
                 def __exit__(self, *args): pass
             module = SimpleNamespace(sync_playwright=Playwright, expect=Assertions)
             with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': module}), patch('importlib.metadata.version', return_value=common.PLAYWRIGHT_VERSION):
-                self.assertEqual(run(flow_path, self.axe, scratch, 'http://app:8080'), 0)
+                self.assertEqual(run(flow_path, self.axe, scratch, base_url), 0)
             report = json.loads((scratch / 'candidate.json').read_text())
             self.assertEqual(report['execution'], 'COMPLETED')
             self.assertEqual(report['tools']['axe_runtime'], '4.10.3')

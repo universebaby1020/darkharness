@@ -168,6 +168,8 @@ def execute(args, docker_factory=Docker):
             if runner_observed != RUNNER_IMAGE:
                 raise ValueError('RUNNER_PIN_MISMATCH')
             network = 'uiqa-' + effect
+            # One local owner for the Docker alias and browser's allowed origin.
+            internal_alias = 'service'
             label = f'{LABEL}={effect}'
             iid = scratch / 'app-image-id'
             phase = 'app_build'
@@ -177,7 +179,7 @@ def execute(args, docker_factory=Docker):
             checked(docker, 'network', 'create', '--internal', '--label', label, network)
             phase = 'app_start'
             checked(docker, 'run', '-d', '--name', network + '-app', '--label', label,
-                    '--network', network, '--network-alias', 'app', app_image)
+                    '--network', network, '--network-alias', internal_alias, app_image)
             phase = 'app_startup_state'
             observed_app_state = app_state(docker, network + '-app')
             if observed_app_state['status'] == 'exited':
@@ -198,7 +200,7 @@ def execute(args, docker_factory=Docker):
                             '--network', network, '--read-only',
                             '--security-opt', 'no-new-privileges', '-e', 'TMPDIR=/scratch/tmp',
                             '-e', 'PYTHONDONTWRITEBYTECODE=1', *mounts, RUNNER_IMAGE,
-                            'python3', '-B', '/checker/browser_worker.py', '/flow.json', '/axe.min.js', '/scratch', f'http://app:{args.port}',
+                            'python3', '-B', '/checker/browser_worker.py', '/flow.json', '/axe.min.js', '/scratch', f'http://{internal_alias}:{args.port}',
                             '--host-uid', str(os.getuid()), '--host-gid', str(os.getgid()))
             code = result.returncode
             phase = 'candidate_read'
