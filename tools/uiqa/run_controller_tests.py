@@ -79,7 +79,11 @@ def prepare_copy(args, root, mode):
         html += '<div style="width:2000px;height:50px">Overflow control</div>' if mode == 'overflow' else '<button></button>'
         html += '</main></body></html>'
         (stage / 'uiqa-control.html').write_text(html)
-        (stage / 'Dockerfile').write_text(f'FROM {RUNNER_IMAGE}\nCOPY uiqa-control.html /srv/index.html\nWORKDIR /srv\nCMD ["python3", "-m", "http.server", "8000"]\n')
+        # Extend the authorized toy Dockerfile (Python base), not FROM an image
+        # config ID: BuildKit interprets sha256:<ID> as a registry repository.
+        # Browser container still runs by exact official RUNNER_IMAGE ID.
+        dockerfile = stage / 'Dockerfile'
+        dockerfile.write_text(dockerfile.read_text() + '\nCOPY uiqa-control.html /srv/index.html\nWORKDIR /srv\nCMD ["python3", "-m", "http.server", "8000"]\n')
         flow = {'spec_reference': 'Injected negative control spec: heading Control at /; fixture is not production evidence',
                 'author': 'controller negative fixture', 'viewports': flow['viewports'],
                 'scenarios': [{'id': 'control', 'path': '/', 'steps': [{'action': 'text', 'selector': 'h1', 'value': 'Control'}]}]}
@@ -90,6 +94,22 @@ def prepare_copy(args, root, mode):
         paths += ['stage-2/Dockerfile']
     (result / 'uiqa-flow.json').write_text(json.dumps(flow))
     return result, paths
+
+
+def expected_failure_cause(mode, report):
+    if report is None:
+        return False
+    diagnostic = report.get('diagnostic', {})
+    if mode == 'missing-axe':
+        return (report['execution'] == 'ERROR' and diagnostic.get('phase') == 'axe_validation'
+                and diagnostic.get('exception_class') == 'FileNotFoundError')
+    if mode == 'startup-fail':
+        state = report.get('app_state') or {}
+        return (report['execution'] == 'ERROR' and state.get('running') is False
+                and state.get('status') == 'exited' and state.get('exit_code') == 1
+                and diagnostic.get('phase') in {'app_startup_state', 'navigation'}
+                and diagnostic.get('exception_class') in {'RuntimeError', 'Error', 'TimeoutError'})
+    return True
 
 
 async def run_case(args, root, mode, manifest, guard):
@@ -139,12 +159,12 @@ async def run_case(args, root, mode, manifest, guard):
             passed = result['state'] == 'FAILED'
         passed = passed and child is not None and count == 1
         if mode in {'missing-axe', 'startup-fail'}:
-            passed = passed and report is not None and report['execution'] == 'ERROR' and report['cleanup']['verified']
+            passed = passed and expected_failure_cause(mode, report) and report['cleanup']['verified']
         if mode == 'api-only':
             passed = passed and report is not None and report['checks'][0]['status'] == 'N/A' and report['summary']['applicable'] == 0
         if mode in {'overflow', 'axe-violation'}:
             expected_kind = 'document_horizontal_overflow' if mode == 'overflow' else 'violations'
-            passed = passed and report is not None and any(f['kind'] == expected_kind for f in report['findings'])
+            passed = passed and report is not None and result['exit_code'] == 0 and report['execution'] == 'COMPLETED' and report['cleanup']['verified'] and any(f['kind'] == expected_kind for f in report['findings'])
         # A known ERROR must not fence the next broker start. Use new independent
         # work attempt after continuation creation; do not mutate old effect state.
         fence_rows = owner.db.execute("SELECT COUNT(*) FROM c_verification_effect WHERE state='UNKNOWN'").fetchone()[0]
@@ -156,6 +176,9 @@ async def run_case(args, root, mode, manifest, guard):
                     'continuation_count': count, 'guarded_read_sha256': page['sha256'] if page else None,
                     'unknown_fence_rows': fence_rows, 'integration_tool_path_accepted': bool(passed),
                     'sut_criteria_accepted': result['accepted'], 'genuine_findings_preserved': bool(report and report['findings']),
+                    'expected_failure_cause_observed': expected_failure_cause(mode, report) if mode in {'missing-axe', 'startup-fail'} else None,
+                    'app_state': report.get('app_state') if report else None,
+                    'diagnostic': report.get('diagnostic') if report else None,
                     'visual_review': 'NOT_PERFORMED'}
         atomic_json(root / 'case.json', evidence)
         return {'mode': mode, 'passed': bool(passed), 'state': result['state'], 'raw': str(root / 'case.json')}

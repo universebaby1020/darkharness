@@ -29,7 +29,9 @@ class FakeDocker:
     def __call__(self, *args):
         self.calls.append(args)
         output, code = b'', 0
-        if args[:2] == ('image', 'inspect'):
+        if args[0] == 'inspect':
+            output = json.dumps({'running': self.mode != 'startup-fail', 'status': 'exited' if self.mode == 'startup-fail' else 'running', 'exit_code': 1 if self.mode == 'startup-fail' else 0}).encode()
+        elif args[:2] == ('image', 'inspect'):
             output = common.RUNNER_IMAGE.encode()
         elif args[0] == 'build':
             (self.scratch / 'app-image-id').write_text('sha256:app')
@@ -112,6 +114,112 @@ class CheckerTests(unittest.TestCase):
         self.assertIn('--label', network)
         self.assertEqual(self.report()['effects'], {'docker': True, 'network': True})
         self.assertEqual(self.report()['visual_review'], 'NOT_PERFORMED')
+
+    def test_official_runner_identity_and_private_owner_handoff(self):
+        self.run_fake()
+        run = next(c for c in self.docker.calls if c[0] == 'run' and '-d' not in c)
+        self.assertNotIn('--user', run)
+        self.assertNotIn('--cap-drop', run)
+        self.assertFalse(any(a.startswith('HOME=') for a in run))
+        self.assertNotIn('--privileged', run)
+        self.assertIn('--read-only', run)
+        self.assertIn('no-new-privileges', run)
+        self.assertEqual(run[run.index('--host-uid') + 1], '1000')
+        self.assertEqual(run[run.index('--host-gid') + 1], '1000')
+        self.assertIn('TMPDIR=/scratch/tmp', run)
+
+    def test_host_diagnostic_class_and_phase_only(self):
+        self.run_fake('build-fail')
+        diagnostic = self.report()['diagnostic']
+        self.assertEqual(diagnostic, {'phase': 'app_build', 'exception_class': 'RuntimeError'})
+        self.assertEqual(json.loads((self.docker.scratch / 'host-diagnostic.json').read_text()), diagnostic)
+        self.assertNotIn('DOCKER_COMMAND_FAILED', json.dumps(self.report()))
+
+    def test_browser_diagnostic_redaction_and_owner_return(self):
+        import browser_worker
+        argv = ['flow', 'axe', str(self.root), 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
+        def failed(flow, axe, scratch, base, progress):
+            progress['phase'] = 'browser_launch'
+            raise RuntimeError('UNTRUSTED_EXCEPTION_SENTINEL')
+        with patch.object(browser_worker, 'run', failed), patch.object(browser_worker.os, 'chown', create=True) as chown:
+            self.assertEqual(browser_worker.main(argv), 1)
+        candidate = json.loads((self.root / 'candidate.json').read_text())
+        self.assertEqual(candidate['diagnostic'], {'phase': 'browser_launch', 'exception_class': 'RuntimeError'})
+        self.assertNotIn('UNTRUSTED_EXCEPTION_SENTINEL', json.dumps(candidate))
+        self.assertTrue(chown.called)
+        self.assertTrue(all(c.kwargs == {'follow_symlinks': False} and c.args[1:] == (1000, 1000) for c in chown.call_args_list))
+
+    def test_startup_exit_cause_not_browser_initialization_contamination(self):
+        self.assertEqual(self.run_fake('startup-fail'), 1)
+        report = self.report()
+        self.assertEqual(report['app_state'], {'running': False, 'status': 'exited', 'exit_code': 1})
+        self.assertEqual(report['diagnostic']['phase'], 'app_startup_state')
+        self.assertFalse(any(c[0] == 'run' and '-d' not in c for c in self.docker.calls))
+        spec = importlib.util.spec_from_file_location('uiqa_controller_tests', UIQA / 'run_controller_tests.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(module.expected_failure_cause('startup-fail', report))
+        for phase in ('tool_import', 'playwright_start', 'browser_launch', 'axe_scan'):
+            report['diagnostic']['phase'] = phase
+            self.assertFalse(module.expected_failure_cause('startup-fail', report))
+        report['diagnostic']['phase'] = 'navigation'
+        report['diagnostic']['exception_class'] = 'Error'
+        self.assertTrue(module.expected_failure_cause('startup-fail', report))
+        report['app_state']['exit_code'] = 0
+        self.assertFalse(module.expected_failure_cause('startup-fail', report))
+        self.assertFalse(module.expected_failure_cause('missing-axe', report))
+
+    def test_real_phase_tracking_with_fake_browser_launch_failure(self):
+        from types import SimpleNamespace
+        import browser_worker
+        def launch(**kwargs):
+            raise RuntimeError('PRIVATE_MESSAGE_MUST_NOT_ESCAPE')
+        class Playwright:
+            def __enter__(self): return SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+            def __exit__(self, *args): pass
+        module = SimpleNamespace(sync_playwright=Playwright, expect=None)
+        argv = [str(self.checkout / 'flows/ui.json'), str(self.axe), str(self.root), 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
+        with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': module}), patch('importlib.metadata.version', return_value=common.PLAYWRIGHT_VERSION), patch.object(browser_worker.os, 'chown', create=True):
+            self.assertEqual(browser_worker.main(argv), 1)
+        diagnostic = json.loads((self.root / 'browser-diagnostic.json').read_text())
+        self.assertEqual(diagnostic, {'phase': 'browser_launch', 'exception_class': 'RuntimeError'})
+        self.assertNotIn('PRIVATE_MESSAGE_MUST_NOT_ESCAPE', (self.root / 'candidate.json').read_text())
+
+    def test_browser_owner_return_preserves_private_mode_and_denies_links(self):
+        import browser_worker
+        path = self.root / 'private.json'
+        common.atomic_json(path, {'fixture': True})
+        before = path.stat().st_mode
+        with patch.object(browser_worker.os, 'chown', create=True):
+            browser_worker.return_scratch_ownership(self.root, 1000, 1000)
+        self.assertEqual(path.stat().st_mode, before)
+        import os
+        os.link(path, self.root / 'hardlinked')
+        with patch.object(browser_worker.os, 'chown', create=True) as chown:
+            with self.assertRaises(ValueError):
+                browser_worker.return_scratch_ownership(self.root, 1000, 1000)
+            chown.assert_not_called()
+
+    def test_negative_control_extends_toy_dockerfile_not_runner_id(self):
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location('uiqa_controller_tests', UIQA / 'run_controller_tests.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for mode in ('overflow', 'axe-violation'):
+            root = self.root / mode
+            stage = root / 'result/stage-2'
+            stage.mkdir(parents=True)
+            original = 'FROM python:3.12-slim\nWORKDIR /app\nCMD ["python", "server.py"]\n'
+            (stage / 'Dockerfile').write_text(original)
+            args = SimpleNamespace(result_repo='readonly', revision=REVISION, flow=str(self.checkout / 'flows/ui.json'))
+            with patch.object(module, 'command'):
+                result, paths = module.prepare_copy(args, root, mode)
+            dockerfile = (stage / 'Dockerfile').read_text()
+            self.assertTrue(dockerfile.startswith(original))
+            self.assertNotIn('FROM sha256:', dockerfile)
+            self.assertIn('http.server', dockerfile)
+            self.assertEqual(json.loads((result / 'uiqa-flow.json').read_text())['viewports'], FLOW['viewports'])
+            self.assertIn('stage-2/uiqa-control.html', paths)
 
     def test_completed_findings_exit_zero_but_rejected(self):
         self.assertEqual(self.run_fake('findings'), 0)

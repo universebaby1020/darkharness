@@ -11,6 +11,15 @@ LABEL = 'org.darkharness.uiqa.effect'
 REPORT_FILE = 'uiqa.json'
 
 
+def safe_exception_class(exc):
+    # Do not serialize exception messages, URLs, DOM or arbitrary class names.
+    name = type(exc).__name__
+    return name if name in {'AssertionError', 'ValueError', 'RuntimeError',
+                            'FileNotFoundError', 'PermissionError', 'OSError',
+                            'KeyError', 'TypeError', 'JSONDecodeError',
+                            'Error', 'TimeoutError', 'KeyboardInterrupt'} else 'Exception'
+
+
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
