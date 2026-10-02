@@ -63,20 +63,7 @@ class IntegrationService(Service):
         if not router.active():
             raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
         broker = LocalGitBroker(self.manager.mailbox, router, 'Recovery observer', 'recovery@actors.invalid', router.workspace)
-        def idle_pids():
-            # Only readiness clients with no attempt binding are exempt. Old or
-            # active native processes cannot be declared safe by the payload.
-            from .codex import OwnedStdioClient, group_members
-            found = set()
-            for adapter in self.manager.adapters:
-                if adapter.worker is not None and not adapter.worker.done():
-                    continue
-                for state in adapter._room_clients.values():
-                    client = state.client
-                    if isinstance(client, OwnedStdioClient) and getattr(client, 'evidence', None) and client.evidence.context is None and client.group is not None:
-                        found.update(identity[0] for identity in group_members(client.group))
-            return found
-        return Recovery(self.manager.mailbox, router, broker, idle_pids)
+        return Recovery(self.manager.mailbox, router, broker, self.manager.idle_client_pids)
 
     def close(self):
         # Called outside service.mutex, otherwise the async cleanup cannot commit.

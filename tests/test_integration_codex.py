@@ -333,7 +333,7 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         answer = '@example-account/dh-builder /dh-answer ' + q['id'] + '\ncomplete peer answer: 21 bytes'
         with self.assertRaisesRegex(IntegrationError, 'PEER_BINDING_DENIED'):
             await self.deliver(self.message('spoof', answer, 'wrong-sender'))
-        await self.deliver(self.message('995e6181-24a1-4115-880f-ed19dc73652b', answer, 'coordinator-id'))
+        await self.deliver(self.message('11111111-2222-4333-8444-555555555555', answer, 'coordinator-id'))
         self.assertFalse(self.adapter.worker.done())
         canonical = self.owner.db.execute("SELECT * FROM c_event WHERE kind='PEER_ANSWER'").fetchall()
         self.assertEqual(len(canonical), 1)

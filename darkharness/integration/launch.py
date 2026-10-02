@@ -378,7 +378,7 @@ class SeatManager:
     def recover_timeouts_on_startup(self):
         results = []
         for adapter in self.adapters:
-            if not adapter.auto_recover_settled_timeouts:
+            if not getattr(adapter, 'auto_recover_settled_timeouts', False):
                 continue
             from .codex_timeout import CodexTimeoutRecovery
             recovery = CodexTimeoutRecovery(self.mailbox, adapter.router, adapter.git_broker)
