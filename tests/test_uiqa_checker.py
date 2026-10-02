@@ -7,6 +7,21 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from contextlib import contextmanager
+import stat
+
+
+@contextmanager
+def worker_scratch_mount(root):
+    """Map only the controlled mount in worker tests; never chown real files."""
+    import browser_worker
+    def mapped(value):
+        return root if str(value) == '/scratch' else Path(value)
+    with patch.object(browser_worker, 'Path', side_effect=mapped), \
+         patch.object(browser_worker, 'regular_tree', side_effect=lambda value: common.regular_tree(mapped(value))), \
+         patch.object(browser_worker.os, 'getuid', create=True, return_value=23), \
+         patch.object(browser_worker.os, 'getgid', create=True, return_value=24):
+        yield
 
 UIQA = Path(__file__).resolve().parents[1] / 'tools/uiqa'
 sys.path.insert(0, str(UIQA))
@@ -67,7 +82,7 @@ class FakeDocker:
 class CheckerTests(unittest.TestCase):
     def setUp(self):
         # All test-generated files stay within the owned evidence subtree.
-        area = Path(__file__).resolve().parents[1] / 'evidence/wo-dh0-02r3-uiqa-navigation/local-tests'
+        area = Path(__file__).resolve().parents[1] / 'evidence/wo-dh0-02r3-uiqa-scratch-owner/local-tests'
         area.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=area)
         self.root = Path(self.temp.name)
@@ -161,17 +176,18 @@ class CheckerTests(unittest.TestCase):
 
     def test_browser_diagnostic_redaction_and_owner_return(self):
         import browser_worker
-        argv = ['flow', 'axe', str(self.root), 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
+        argv = ['flow', 'axe', '/scratch', 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
         def failed(flow, axe, scratch, base, progress):
             progress['phase'] = 'browser_launch'
             raise RuntimeError('UNTRUSTED_EXCEPTION_SENTINEL')
-        with patch.object(browser_worker, 'run', failed), patch.object(browser_worker.os, 'chown', create=True) as chown:
+        with worker_scratch_mount(self.root), patch.object(browser_worker, 'run', failed), patch.object(browser_worker.os, 'chown', create=True) as chown:
             self.assertEqual(browser_worker.main(argv), 1)
         candidate = json.loads((self.root / 'candidate.json').read_text())
         self.assertEqual(candidate['diagnostic'], {'phase': 'browser_launch', 'exception_class': 'RuntimeError'})
         self.assertNotIn('UNTRUSTED_EXCEPTION_SENTINEL', json.dumps(candidate))
         self.assertTrue(chown.called)
-        self.assertTrue(all(c.kwargs == {'follow_symlinks': False} and c.args[1:] == (1000, 1000) for c in chown.call_args_list))
+        self.assertTrue(all(c.kwargs == {'follow_symlinks': False} and c.args[1:] in {(23, 24), (1000, 1000)} for c in chown.call_args_list))
+        self.assertEqual(chown.call_args_list[-1].args, (self.root, 1000, 1000))
 
     def test_startup_exit_cause_not_browser_initialization_contamination(self):
         self.assertEqual(self.run_fake('startup-fail'), 1)
@@ -202,8 +218,8 @@ class CheckerTests(unittest.TestCase):
             def __enter__(self): return SimpleNamespace(chromium=SimpleNamespace(launch=launch))
             def __exit__(self, *args): pass
         module = SimpleNamespace(sync_playwright=Playwright, expect=None)
-        argv = [str(self.checkout / 'flows/ui.json'), str(self.axe), str(self.root), 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
-        with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': module}), patch('importlib.metadata.version', return_value=common.PLAYWRIGHT_VERSION), patch.object(browser_worker.os, 'chown', create=True):
+        argv = [str(self.checkout / 'flows/ui.json'), str(self.axe), '/scratch', 'http://app:8080', '--host-uid', '1000', '--host-gid', '1000']
+        with worker_scratch_mount(self.root), patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': module}), patch('importlib.metadata.version', return_value=common.PLAYWRIGHT_VERSION), patch.object(browser_worker.os, 'chown', create=True):
             self.assertEqual(browser_worker.main(argv), 1)
         diagnostic = json.loads((self.root / 'browser-diagnostic.json').read_text())
         self.assertEqual(diagnostic, {'phase': 'browser_launch', 'exception_class': 'RuntimeError'})
@@ -479,6 +495,156 @@ class CheckerTests(unittest.TestCase):
         with patch.object(FakeDocker, '__call__', interrupted):
             self.assertEqual(self.run_fake(), 1)
         self.assertTrue(self.report()['cleanup']['verified'])
+
+
+class WorkerOwnershipTests(unittest.TestCase):
+    """Linux filesystem validation with fake ownership, no Docker or host sudo."""
+    def setUp(self):
+        import os
+        if not hasattr(os, 'getuid') or not hasattr(os, 'mkfifo'):
+            self.skipTest('Linux worker filesystem tests required')
+        area = Path(__file__).resolve().parents[1] / 'evidence/wo-dh0-02r3-uiqa-scratch-owner/local-tests'
+        area.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=area)
+        self.root = Path(self.temp.name)
+        (self.root / 'tmp').mkdir(mode=0o700)
+        common.atomic_json(self.root / 'tmp/seed.json', {'fixture': True})
+        self.paths = [self.root, *self.root.rglob('*')]
+        self.modes = {p: p.stat().st_mode for p in self.paths}
+        self.owners = {p: (1000, 1001) for p in self.paths}
+        self.calls = []
+        self.argv = ['flow', 'axe', '/scratch', 'http://service:8080', '--host-uid', '1000', '--host-gid', '1001']
+
+    def tearDown(self):
+        if hasattr(self, 'temp'):
+            self.temp.cleanup()
+
+    def chown(self, path, uid, gid, *, follow_symlinks):
+        path = Path(path)
+        self.assertFalse(follow_symlinks)
+        self.assertTrue(path == self.root or self.root in path.parents)
+        self.calls.append((path, uid, gid))
+        self.owners[path] = (uid, gid)
+
+    def invoke(self, run, chown=None, writer=None):
+        import browser_worker
+        with worker_scratch_mount(self.root), patch.object(browser_worker, 'run', side_effect=run), \
+             patch.object(browser_worker.os, 'chown', side_effect=chown or self.chown):
+            if writer is None:
+                return browser_worker.main(self.argv)
+            with patch.object(browser_worker, 'atomic_json', side_effect=writer):
+                return browser_worker.main(self.argv)
+
+    def test_root_and_children_handoff_then_return_on_success_and_flow_error(self):
+        for failed in (False, True):
+            with self.subTest(flow_error=failed):
+                self.calls.clear()
+                def run(flow, axe, scratch, base, progress):
+                    for path in [self.root, *self.root.rglob('*')]:
+                        self.assertEqual(self.owners[path], (23, 24))
+                    # Model newly written files as owned by the running container.
+                    artifact = self.root / 'artifact.json'
+                    common.atomic_json(artifact, {'fixture': True})
+                    self.owners[artifact] = (23, 24)
+                    if failed:
+                        progress['phase'] = 'flow_actions'
+                        raise AssertionError('fixture flow failure')
+                    common.atomic_json(self.root / 'candidate.json', {'execution': 'COMPLETED'})
+                    return 0
+                self.assertEqual(self.invoke(run), 1 if failed else 0)
+                for path in [self.root, *self.root.rglob('*')]:
+                    self.assertEqual(self.owners[path], (1000, 1001))
+                for path, mode in self.modes.items():
+                    self.assertEqual(path.stat().st_mode, mode)
+                self.assertEqual(self.calls[0], (self.root, 23, 24))
+                self.assertEqual(self.calls[-1], (self.root, 1000, 1001))
+                returns = [p for p, uid, gid in self.calls if (uid, gid) == (1000, 1001)]
+                self.assertEqual(set(returns), {self.root, *self.root.rglob('*')})
+                self.assertEqual(returns.count(self.root), 1)
+                if failed:
+                    self.assertEqual(json.loads((self.root / 'candidate.json').read_text())['execution'], 'ERROR')
+
+    def test_unsafe_tree_rejected_before_any_owner_or_report_change(self):
+        import os
+        import browser_worker
+        for kind in ('file-link', 'directory-link', 'hardlink', 'fifo'):
+            with self.subTest(kind=kind):
+                unsafe = self.root / 'unsafe'
+                if kind == 'file-link': unsafe.symlink_to(self.root / 'tmp/seed.json')
+                elif kind == 'directory-link': unsafe.symlink_to(self.root / 'tmp', target_is_directory=True)
+                elif kind == 'hardlink': os.link(self.root / 'tmp/seed.json', unsafe)
+                else: unsafe.write_bytes(b'fixture special inode')
+                original_lstat = Path.lstat
+                def lstat(path, **kwargs):
+                    observed = original_lstat(path, **kwargs)
+                    if kind == 'fifo' and path == unsafe:
+                        # DrvFS cannot create FIFOs; model only the inode type.
+                        return os.stat_result((stat.S_IFIFO | 0o600, *observed[1:]))
+                    return observed
+                try:
+                    with patch.object(Path, 'lstat', new=lstat):
+                        with patch.object(browser_worker, 'run') as run:
+                            with self.assertRaises(ValueError):
+                                self.invoke(run)
+                            run.assert_not_called()
+                        self.assertEqual(self.calls, [])
+                        self.assertFalse((self.root / 'candidate.json').exists())
+                        self.assertFalse((self.root / 'browser-diagnostic.json').exists())
+                        for helper in (lambda: browser_worker.take_scratch_ownership(self.root),
+                                       lambda: browser_worker.return_scratch_ownership(self.root, 1000, 1001)):
+                            with patch.object(browser_worker.os, 'chown') as chown:
+                                with self.assertRaises(ValueError): helper()
+                                chown.assert_not_called()
+                finally:
+                    unsafe.unlink()
+
+    def test_only_exact_controlled_mount_accepted(self):
+        import browser_worker
+        for scratch in (str(self.root), '/scratch/tmp', '/scratch/../scratch', '/'):
+            argv = list(self.argv)
+            argv[2] = scratch
+            with patch.object(browser_worker.os, 'chown') as chown, patch.object(browser_worker, 'run') as run:
+                with self.assertRaises(ValueError): browser_worker.main(argv)
+                chown.assert_not_called()
+                run.assert_not_called()
+
+    def test_partial_handoff_failure_restores_and_never_runs(self):
+        import browser_worker
+        def chown(path, uid, gid, **kwargs):
+            if (uid, gid) == (23, 24) and Path(path) != self.root:
+                raise PermissionError('fixture owner failure')
+            self.chown(path, uid, gid, **kwargs)
+        with patch.object(browser_worker, 'run') as run:
+            self.assertEqual(self.invoke(run, chown=chown), 1)
+            run.assert_not_called()
+        for path in [self.root, *self.root.rglob('*')]:
+            self.assertEqual(self.owners[path], (1000, 1001))
+        self.assertEqual(json.loads((self.root / 'candidate.json').read_text())['diagnostic']['phase'], 'scratch_handoff')
+
+    def test_diagnostic_io_failure_still_returns_root_last(self):
+        def writer(path, data):
+            raise OSError('fixture write failure')
+        with self.assertRaises(OSError):
+            self.invoke(lambda *args: 0, writer=writer)
+        self.assertEqual(self.calls[-1], (self.root, 1000, 1001))
+        self.assertTrue(all(owner == (1000, 1001) for owner in self.owners.values()))
+
+    def test_return_failure_cannot_exit_success(self):
+        def chown(path, uid, gid, **kwargs):
+            if (uid, gid) == (1000, 1001):
+                raise PermissionError('fixture return failure')
+            self.chown(path, uid, gid, **kwargs)
+        with self.assertRaises(PermissionError):
+            self.invoke(lambda *args: 0, chown=chown)
+
+    def test_unsafe_tree_created_during_run_denies_return(self):
+        import os
+        def run(*args):
+            os.link(self.root / 'tmp/seed.json', self.root / 'unsafe')
+            return 0
+        with self.assertRaises(ValueError):
+            self.invoke(run)
+        self.assertFalse(any((uid, gid) == (1000, 1001) for _, uid, gid in self.calls))
 
 
 if __name__ == '__main__':

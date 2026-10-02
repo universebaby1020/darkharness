@@ -170,12 +170,20 @@ def run(flow_path, axe_path, scratch, base_url, progress=None):
     return 0
 
 
+def take_scratch_ownership(scratch):
+    # Only the trusted CLI's /scratch mount is handed to the current container
+    # identity. Validate the whole tree before changing even the root owner.
+    root = regular_tree(scratch)
+    uid, gid = os.getuid(), os.getgid()
+    for path in (root, *root.rglob('*')):
+        os.chown(path, uid, gid, follow_symlinks=False)
+
+
 def return_scratch_ownership(scratch, uid, gid):
-    # Official runner runs as image-default root. Keep private files mode 0600
-    # while making them readable to the trusted host UID after container exit.
-    # Never follow symlinks or transfer special/hardlinked files to the host.
-    regular_tree(scratch)
-    for path in Path(scratch).rglob('*'):
+    # Preserve private permission bits; reject links/special/hardlinked files
+    # before any change. Return children first and the mount root last.
+    root = regular_tree(scratch)
+    for path in (*root.rglob('*'), root):
         os.chown(path, uid, gid, follow_symlinks=False)
 
 
@@ -188,9 +196,16 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.host_uid < 0 or args.host_gid < 0:
         raise ValueError('OWNER_INVALID')
-    progress = {'phase': 'initialization', 'exception_class': None}
+    if args.scratch != '/scratch':
+        raise ValueError('SCRATCH_MOUNT_REQUIRED')
+    # Fail closed before diagnostic writes or the finally ownership return.
+    root = regular_tree(args.scratch)
+    if not root.is_dir():
+        raise ValueError('SCRATCH_DIRECTORY_REQUIRED')
+    progress = {'phase': 'scratch_handoff', 'exception_class': None}
     code = 1
     try:
+        take_scratch_ownership(args.scratch)
         code = run(args.flow, args.axe, args.scratch, args.base_url, progress)
     except Exception as exc:
         progress['exception_class'] = safe_exception_class(exc)
@@ -200,8 +215,10 @@ def main(argv=None):
             'findings': [], 'artifacts': [], 'error': 'BROWSER_OR_FLOW_ERROR',
             'diagnostic': dict(progress)})
     finally:
-        atomic_json(Path(args.scratch) / 'browser-diagnostic.json', progress)
-        return_scratch_ownership(args.scratch, args.host_uid, args.host_gid)
+        try:
+            atomic_json(Path(args.scratch) / 'browser-diagnostic.json', progress)
+        finally:
+            return_scratch_ownership(args.scratch, args.host_uid, args.host_gid)
     return code
 
 
