@@ -21,6 +21,7 @@ class RuntimeBinding:
     effort: str = ""
     settings_sha256: str = ""
     settings_sources: tuple[tuple[str, str], ...] = field(default=(), compare=False)
+    result_repo: str | None = None  # explicit repository narrowing, not native cwd
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class SeatSettings:
     command: tuple[str, ...] = field(repr=False)
     runtime_env: tuple[tuple[str, str], ...] = field(repr=False)
     sources: tuple[tuple[str, str], ...] = field(compare=False)
+    result_repo: str | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -47,11 +49,14 @@ class SeatSettings:
         body = {name: getattr(self, name) for name in (
             "connection", "runtime", "workspace", "model", "effort",
             "turn_timeout_s", "command", "runtime_env")}
+        if self.result_repo is not None:
+            body['result_repo'] = self.result_repo
         return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
                                          allow_nan=False).encode()).hexdigest()
 
     def evidence(self) -> dict[str, Any]:
-        return {"connection": self.connection, "runtime": self.runtime,
+        return {**({'result_repo': self.result_repo} if self.result_repo is not None else {}),
+                "connection": self.connection, "runtime": self.runtime,
                 "model": self.model, "effort": self.effort,
                 "effective_timeout_s": self.turn_timeout_s,
                 "sources": dict(self.sources), "settings_sha256": self.fingerprint}

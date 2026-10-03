@@ -17,10 +17,13 @@ class ApprovalRouter:
     Controller scope schema: workspace, seats, rooms, approved_commands (exact argv),
     file_write (bool), expires_at (UTC ISO timestamp), run_id. No wildcard grants.
     """
-    def __init__(self, owner, grant_id, seat, room, run_id, workspace):
+    def __init__(self, owner, grant_id, seat, room, run_id, workspace, *, result_repo=None):
+        from .git_broker import result_repo_boundary
         self.owner, self.grant_id = owner, grant_id
         self.seat, self.room, self.run_id = seat, room, run_id
         self.workspace = str(Path(workspace).resolve())
+        self.configured_result_repo = result_repo
+        self.result_repo = str(result_repo_boundary(self.workspace, result_repo))
 
     def _scope(self, db):
         row = db.execute("SELECT body FROM controls WHERE kind='grant' AND id=?", (self.grant_id,)).fetchone()
@@ -43,6 +46,16 @@ class ApprovalRouter:
         if run and json.loads(run[0]).get("state") in {"STOPPED", "COMPLETED", "REVOKED"}:
             return None
         if scope.get("run_id") != self.run_id or self.seat not in scope.get("seats", []) or self.room not in scope.get("rooms", []) or str(Path(scope.get("workspace", "")).resolve()) != self.workspace:
+            return None
+        # Repository narrowing is authenticated alongside the workspace ceiling.
+        # A runtime config cannot choose a different repo using the same Grant.
+        if scope.get('result_repo') != self.configured_result_repo:
+            return None
+        from .git_broker import result_repo_boundary
+        try:
+            if str(result_repo_boundary(self.workspace, self.configured_result_repo)) != self.result_repo:
+                return None
+        except (IntegrationError, OSError, ValueError):
             return None
         return scope
 

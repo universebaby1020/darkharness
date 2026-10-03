@@ -98,6 +98,12 @@ def render_mandate(name, role, harness, model, effort):
             "support the decision. Factory pins are controller information, not seat verification responsibility; "
             "verify the assigned product revision with the granted checks. Reject with reproducible findings and route repairs. "
             "Do not invent a rejection when review passes.\n\n"
+            "## Verification diagnostics\nNOT_STARTED describes absence of a checker intent, not valid input. "
+            "same_input_safe_retry describes duplicate-effect safety, not expected success or new authority. "
+            "For input_correction_required, correct the input or controller configuration: "
+            "RECEIPT_RUN_MISMATCH and CHECK_NOT_GRANTED are expected to recur with unchanged input and authority. "
+            "An outstanding effect from another seat is not your own executed checker effect; "
+            "retain the run fence and let the controller reconcile its actual owner.\n\n"
             "## Local Git and recovery\nKeep the native sandbox enabled. Use "
             "dh_local_git_commit for existing files you authored or were explicitly assigned "
             "to commit, with the canonical repository cwd and exact current HEAD. The broker "
@@ -115,7 +121,9 @@ def render_mandate(name, role, harness, model, effort):
             "## UI quality\nFor applicable UI work, use the provided read-only design pack "
             "and any UI quality helper granted for this run; follow the task specification and existing authority.\n\n"
             "## Evidence reporting\nReport actual commands, results and Git revision. "
-            "Distinguish untested work and uncertain effects from success. Never replay "
+            "Distinguish untested work and uncertain effects from success. An outbox DELIVERY_UNKNOWN "
+            "between SEND_INTENT and SEND_ACK is normal pre-ACK send progress, not proof of a failed send. "
+            "If it remains unresolved, preserve the delivery fence. Never replay "
             "uncertain actions without reconciliation. Keep secrets out of messages.\n")
 
 

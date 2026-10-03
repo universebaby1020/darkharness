@@ -59,7 +59,7 @@ class IntegrationService(Service):
         if not grant:
             raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
         scope = json.loads(grant[0]).get('scope', {})
-        router = ApprovalRouter(self.manager.owner, grant_id, parent['seat'], parent['room'], scope.get('run_id'), scope.get('workspace', ''))
+        router = ApprovalRouter(self.manager.owner, grant_id, parent['seat'], parent['room'], scope.get('run_id'), scope.get('workspace', ''), result_repo=scope.get('result_repo'))
         if not router.active():
             raise IntegrationError('CONTINUATION_GRANT_REQUIRED')
         broker = LocalGitBroker(self.manager.mailbox, router, 'Recovery observer', 'recovery@actors.invalid', router.workspace)

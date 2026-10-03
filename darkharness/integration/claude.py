@@ -410,7 +410,7 @@ class DurableClaudeAdapter(DurableSeatMixin, ClaudeSDKAdapter):
                 else:
                     state = 'FAILED' if result['error'] or not result['terminal_tool'] else 'SUCCEEDED'
                     self.mailbox.update(*context, state=state, delivery='RETURNED', result={**result,
-                        'git': self.guard.sanitize(git_evidence(self.workspace)), 'acceptance': 'NOT_EVALUATED'})
+                        'git': self.guard.sanitize(git_evidence(self.git_broker.root)), 'acceptance': 'NOT_EVALUATED'})
             except BaseException as exc:
                 self.mailbox.update(*context, state='PAUSED', delivery='DELIVERY_UNKNOWN', result={'code': type(exc).__name__, 'replay': 'FENCED'})
                 self._owned_record('CLAUDE_RUNTIME_ERROR', {'code': type(exc).__name__, 'replay': 'FENCED'})
@@ -459,11 +459,16 @@ class DurableClaudeAdapter(DurableSeatMixin, ClaudeSDKAdapter):
 
 class ClaudeRuntime(DurableRuntime):
     async def readiness(self):
+        settings = self.adapter.effective_settings
+        if (settings.result_repo != getattr(self.adapter.router, 'configured_result_repo', None) or
+                str(self.adapter.git_broker.root) != self.adapter.router.result_repo):
+            raise IntegrationError('RESULT_REPO_BINDING_MISMATCH')
         dependency_check()
         # Local-only readiness does not claim auth, provider/model availability,
         # native CLI qualification or inference. No login/version/inference probe.
         return {'ready': True, 'level': 'LOCAL_COMPONENT', 'authentication': 'NOT_PROBED',
                 'inference': 'NOT_RUN', 'execution_qualification': 'NOT_RUN',
+                'prompt_sha256': digest(self.adapter.config.custom_section.encode()),
                 'effective_settings': self.adapter.effective_settings.evidence()}
 
     async def start(self, binding):

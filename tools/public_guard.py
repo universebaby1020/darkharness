@@ -177,14 +177,17 @@ def resolve(ref):
     return oid
 
 
-def scan_ref(base, target, private):
+def scan_ref(base, target, private, *, metadata=None):
     base, target = resolve(base), resolve(target)
     if git('merge-base', base, target).decode().strip() != base:
         raise ValueError('BASE_NOT_ANCESTOR')
     rows = []
     # No --first-parent: inspect all commits, including merged branches.
-    for commit in git('rev-list', '--reverse', base + '..' + target).decode().splitlines():
+    commits = git('rev-list', '--reverse', base + '..' + target).decode().splitlines()
+    for commit in commits:
         rows.extend(scan_commit(commit, private))
+    if metadata is not None:
+        metadata.update(mode='ref', base=base, target=target, checked_commit_count=len(commits))
     return rows
 
 
@@ -198,17 +201,26 @@ def main():
     parser.add_argument('--base', default='d965945c50ab370cd979eefa8be1536f657007d1')
     parser.add_argument('--message-file', type=Path, default=os.environ.get("DH_PUBLIC_MESSAGE_FILE"), help='required precommit message; index mode only')
     args = parser.parse_args()
+    # Only resolved commit IDs are output; untrusted ref text stays suppressed.
+    metadata = {'mode': 'ref' if args.ref else 'revision' if args.revision else
+                'published-history' if args.published_history else 'index',
+                'base': None, 'target': None, 'checked_commit_count': None}
     try:
         repo = Path(git('rev-parse', '--show-toplevel').decode().strip())
         private = load_private(args.private_config, repo)
         if args.ref:
-            rows = scan_ref(args.base, args.ref, private)
+            rows = scan_ref(args.base, args.ref, private, metadata=metadata)
         elif args.revision:
-            rows = scan_commit(resolve(args.revision), private)
+            target = resolve(args.revision)
+            rows = scan_commit(target, private)
+            metadata.update(target=target, checked_commit_count=1)
         elif args.published_history:
+            target = resolve(args.published_history)
+            commits = git('rev-list', '--reverse', target).decode().splitlines()
             rows = []
-            for commit in git('rev-list', '--reverse', resolve(args.published_history)).decode().splitlines():
+            for commit in commits:
                 rows.extend(scan_commit(commit, private))
+            metadata.update(target=target, checked_commit_count=len(commits))
         else:
             if not args.message_file:
                 raise ValueError('PRECOMMIT_MESSAGE_REQUIRED')
@@ -216,7 +228,8 @@ def main():
             for field in ('AUTHOR', 'COMMITTER'):
                 rows.extend(records('<' + field.lower() + '>', git('var', 'GIT_' + field + '_IDENT'), private))
             rows.extend(records('<commit-message>', args.message_file.read_bytes(), private))
-        print(json.dumps({'status': 'EXPOSURE_RECORD_ONLY' if args.published_history else ('PUBLIC_GUARD_DENY' if rows else 'PUBLIC_GUARD_PASS'),
+            metadata.update(target='INDEX', checked_commit_count=0)
+        print(json.dumps({**metadata, 'status': 'EXPOSURE_RECORD_ONLY' if args.published_history else ('PUBLIC_GUARD_DENY' if rows else 'PUBLIC_GUARD_PASS'),
                           'guard_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                           'private_config_sha256': private.get('_sha256'),
                           'private_counts': {key: len(private.get(key, [])) for key in PRIVATE_TYPES},
@@ -224,6 +237,7 @@ def main():
         return 0 if args.published_history else int(bool(rows))
     except (OSError, ValueError, subprocess.SubprocessError):
         print('PUBLIC_GUARD_ERROR: configuration or Git input invalid; values suppressed')
+        print(json.dumps({**metadata, 'status': 'PUBLIC_GUARD_ERROR', 'scope_complete': False}))
         return 2
 
 

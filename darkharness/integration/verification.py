@@ -38,6 +38,18 @@ from .mailbox import IntegrationError, Mailbox, digest, encode
 
 OID = re.compile(r'[0-9a-f]{40}')
 TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'UNKNOWN'}
+# Typed validation diagnostics, not evidence of execution or renewed authority.
+CORRECT_INPUT_ERRORS = frozenset({
+    'RECEIPT_RUN_MISMATCH', 'CHECK_NOT_GRANTED', 'CHECKOUT_RECEIPT_NOT_GRANTED',
+    'CHECKOUT_RECEIPT_UNKNOWN_OR_AMBIGUOUS', 'CHECKOUT_RECEIPT_MISMATCH',
+    'EXACT_REVISION_REQUIRED', 'VERIFICATION_ID_REQUIRED',
+    'CHECKER_PIN_MISMATCH', 'CHECKER_CWD_ESCAPE', 'ABSOLUTE_EXECUTABLE_REQUIRED',
+    'TRUSTED_EXECUTABLE_REQUIRED', 'FIXED_ARGV_REQUIRED', 'EXACT_PLACEHOLDERS_REQUIRED',
+    'OUTPUT_LAYOUT_INVALID', 'OUTPUT_ROOT_OVERLAP', 'DECLARED_REPORT_CONTRACT_REQUIRED',
+    'BOUNDED_REPORT_PATH_REQUIRED', 'DECLARED_CHECKER_EFFECTS_REQUIRED',
+    'TIMEOUT_INVALID', 'LOG_LIMIT_INVALID', 'LIMIT_SOURCE_REQUIRED',
+    'CLEAN_ENVIRONMENT_REQUIRED', 'LOCAL_DOCKER_ENDPOINT_REQUIRED',
+})
 
 
 def _path(value, *, exists=True):
@@ -171,6 +183,7 @@ class VerificationBroker:
         self.token = uuid.uuid4().hex
         self.lock = threading.RLock()
         self.jobs = {}
+        self._validation_failures = {}  # local typed codes only; never a fence proof
         self.closed = False
         with self.owner.transaction(self.owner.epoch) as db:
             db.execute('CREATE TABLE IF NOT EXISTS c_verification_effect(id TEXT PRIMARY KEY, operation TEXT, attempt TEXT, run_id TEXT, request TEXT, config TEXT, state TEXT, owner TEXT, output TEXT, process TEXT, result TEXT)')
@@ -221,6 +234,8 @@ class VerificationBroker:
                     'workspace': router.workspace, 'seat': router.seat, 'room': router.room,
                     'request_sha256': digest(row['request'].encode()),
                     'receipt_sha256': digest(row['receipt'].encode())}
+            if getattr(router, 'configured_result_repo', None) is not None:
+                body['result_repo'] = router.result_repo
             old = db.execute("SELECT body FROM c_event WHERE operation=? AND kind='GIT_RUN_ORIGIN'", (row['operation'],)).fetchall()
             matching = [json.loads(r[0]) for r in old if json.loads(r[0]).get('id') == row['id']]
             if matching and any(v != body for v in matching):
@@ -240,6 +255,8 @@ class VerificationBroker:
                         'workspace': self.router.workspace, 'seat': work['seat'], 'room': work['room'],
                         'request_sha256': digest(row['request'].encode()),
                         'receipt_sha256': digest(row['receipt'].encode())}
+            if getattr(self.router, 'configured_result_repo', None) is not None:
+                expected['result_repo'] = self.router.result_repo
             if any(origin != expected for origin in origins):
                 raise IntegrationError('RECEIPT_RUN_MISMATCH')
         elif self.receipt_run_resolver is None or self.receipt_run_resolver(db, dict(row)) != self.router.run_id:
@@ -344,7 +361,8 @@ class VerificationBroker:
         request, receipt = json.loads(snap['request']), json.loads(snap['receipt'])
         if request.get('kind') != 'snapshot' or receipt.get('state') != 'SNAPSHOT' or receipt.get('independent') is not True or request.get('revision') != revision or receipt.get('revision') != revision or request.get('path') != receipt.get('path'):
             raise IntegrationError('CHECKOUT_RECEIPT_MISMATCH')
-        source = _path(self.router.workspace)
+        from .git_broker import result_repo_boundary
+        source = _path(str(result_repo_boundary(self.router.workspace, getattr(self.router, 'configured_result_repo', None))))
         identity = _identity(source)
         ref = _git(source, 'symbolic-ref', '-q', 'HEAD').decode().strip()
         if identity != request.get('identity') or binding is not None and binding.get('source_ref') != ref:
@@ -397,6 +415,20 @@ class VerificationBroker:
         return {'id': row['id'], 'state': state, 'result': json.loads(row['result']) if row['result'] else None}
 
     def failure_contract(self, operation, attempt, effect_id):
+        with self.lock:
+            value = self._failure_contract(operation, attempt, effect_id)
+            value.update(input_correction_required=False, same_input_expected_error=None)
+            # Duplicate-effect safety and likely validation outcome are distinct.
+            # A cached code must NEVER weaken the ledger-derived fence.
+            if value['effect_phase'] == 'NOT_STARTED' and value['same_input_safe_retry']:
+                code = self._validation_failures.get((operation, attempt, effect_id))
+                if code in CORRECT_INPUT_ERRORS:
+                    value.update(input_correction_required=True, same_input_expected_error=code,
+                                 retry_diagnostic='INPUT_CORRECTION_REQUIRED',
+                                 retry_message='No verification intent exists; duplicate-effect retry is safe, but unchanged input under unchanged authority is expected to fail again. Correct the input or controller configuration; this does not grant authority.')
+            return value
+
+    def _failure_contract(self, operation, attempt, effect_id):
         """Diagnostic only: durable ledger proof, never error-text inference.
 
         NOT_STARTED is not a Store state. A safe retry means no duplicate checker
@@ -404,6 +436,7 @@ class VerificationBroker:
         Any durable intent or unresolved run effect forbids a safe-retry claim.
         """
         unknown = {'effect_phase': 'UNKNOWN', 'same_input_safe_retry': False,
+                   'retry_diagnostic': 'EXECUTION_OR_LEDGER_UNKNOWN',
                    'retry_message': 'Do not retry; reconcile the existing effect and retain its fence.'}
         try:
             with self.lock, self.owner.transaction(self.owner.epoch) as db:
@@ -412,32 +445,47 @@ class VerificationBroker:
                 if row:
                     if row['operation'] != operation or row['attempt'] != attempt:
                         return unknown
-                    return {**unknown, 'effect_phase': self._view(db, row)['state']}
+                    return {**unknown, 'effect_phase': self._view(db, row)['state'],
+                            'retry_diagnostic': 'OWN_EFFECT_EXISTS'}
                 if effect_id in self.jobs or any(not job.done.is_set() for job in self.jobs.values()):
-                    return unknown  # In-memory ownership is also execution evidence.
+                    return {**unknown, 'retry_diagnostic': 'OWN_EXECUTION_OUTSTANDING'}  # In-memory ownership is also execution evidence.
                 run = db.execute("SELECT body FROM controls WHERE kind='run' AND id=?", (self.router.run_id,)).fetchone()
                 if run and json.loads(run[0]).get('state') in {'UNKNOWN', 'DELIVERY_UNKNOWN', 'EFFECT_UNKNOWN', 'CLOSED_UNRESOLVED'}:
-                    return unknown
+                    return {**unknown, 'retry_diagnostic': 'RUN_EFFECT_UNRESOLVED'}
                 rows = db.execute("SELECT * FROM c_verification_effect WHERE run_id=? AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT')", (self.router.run_id,)).fetchall()
                 if rows:
                     # Other seats may have actively owned jobs in another broker.
                     # Diagnostics must not convert those jobs to UNKNOWN.
-                    return unknown
+                    own = any(r['operation'] == operation or r['owner'] == self.token or
+                              (db.execute('SELECT seat FROM c_work WHERE id=?', (r['operation'],)).fetchone() or [None])[0] == self.router.seat
+                              for r in rows)
+                    if own:
+                        return {**unknown, 'retry_diagnostic': 'OWN_EFFECT_OUTSTANDING'}
+                    return {**unknown, 'retry_diagnostic': 'OTHER_EFFECT_OUTSTANDING',
+                            'retry_message': 'This request has no verification intent, but another seat or broker has an outstanding run effect. Do not retry; controller reconciliation must retain that effect fence, not settle this request as an executed effect.'}
                 if self.closed or work['state'] != 'RUNNING' or not self.router._scope(db):
-                    return {**unknown, 'effect_phase': 'NOT_STARTED'}
+                    return {**unknown, 'effect_phase': 'NOT_STARTED', 'retry_diagnostic': 'AUTHORITY_OR_WORK_INACTIVE'}
                 return {'effect_phase': 'NOT_STARTED', 'same_input_safe_retry': True,
+                        'retry_diagnostic': 'NO_VERIFICATION_INTENT',
                         'retry_message': 'No verification intent exists; retry with the same input is safe from duplicate effects. Existing authority and validation still apply.'}
         except Exception:
             return unknown  # Unreadable ledger is never proof of nonexecution.
 
     def start(self, operation, attempt, effect_id, *, check_id, checkout_receipt, revision):
         """Nonblocking job after validation. Use start_async in an SDK loop."""
-        try:
-            return self._start(operation, attempt, effect_id, check_id=check_id, checkout_receipt=checkout_receipt, revision=revision)
-        except IntegrationError:
-            raise
-        except Exception:
-            raise IntegrationError('VERIFICATION_VALIDATION_UNKNOWN') from None
+        key = (operation, attempt, effect_id)
+        with self.lock:
+            if all(isinstance(x, str) for x in key):
+                self._validation_failures.pop(key, None)
+            try:
+                return self._start(operation, attempt, effect_id, check_id=check_id, checkout_receipt=checkout_receipt, revision=revision)
+            except IntegrationError as error:
+                code = str(error)
+                if code in CORRECT_INPUT_ERRORS and all(isinstance(x, str) for x in key):
+                    self._validation_failures[key] = code
+                raise
+            except Exception:
+                raise IntegrationError('VERIFICATION_VALIDATION_UNKNOWN') from None
 
     def _start(self, operation, attempt, effect_id, *, check_id, checkout_receipt, revision):
         if not all(isinstance(x, str) and x for x in (effect_id, check_id)) or not isinstance(checkout_receipt, (str, dict)):

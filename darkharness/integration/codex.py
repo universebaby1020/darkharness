@@ -235,7 +235,7 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
                       participants_msg=envelope.get("participants_msg"), contacts_msg=envelope.get("contacts_msg"),
                       is_session_bootstrap=True, room_id=self.allowed_room, command=None)
                 await self._retire_owned_client()
-                evidence = self.guard.sanitize(git_evidence(self.workspace))
+                evidence = self.guard.sanitize(git_evidence(self.git_broker.root))
                 self._record("GIT_RESULT", evidence)
                 outcome = self._sdk_outcome or "failed"
                 # Runtime turn completed is NOT parent WorkItem acceptance.
@@ -490,6 +490,10 @@ class CodexRuntime(DurableRuntime):
 
     async def readiness(self):
         a = self.adapter
+        settings = getattr(a, 'effective_settings', None)
+        if settings and (settings.result_repo != getattr(a.router, 'configured_result_repo', None) or
+                         str(a.git_broker.root) != a.router.result_repo):
+            raise IntegrationError('RESULT_REPO_BINDING_MISMATCH')
         a._active_room.set(a.allowed_room)
         a._room_client(a.allowed_room)
         await a._ensure_client_ready()
@@ -503,6 +507,7 @@ class CodexRuntime(DurableRuntime):
         settings = getattr(a, 'effective_settings', None)
         return {"ready": True, "authentication": "chatgpt", "model": a.config.model,
                 "effort": a.config.reasoning_effort, "inference": "NOT_PROBED",
+                "prompt_sha256": digest(a.config.system_prompt.encode()),
                 "effective_settings": settings.evidence() if settings else None,
                 "effective_timeout_s": a.config.turn_timeout_s,
                 "timeout_source": getattr(a, "turn_timeout_source", "adapter_config")}
@@ -514,6 +519,8 @@ class CodexRuntime(DurableRuntime):
             raise IntegrationError('RUNTIME_BINDING_MISMATCH')
         if binding.runtime != 'codex' or (settings and binding.settings_sha256 != settings.fingerprint):
             raise IntegrationError("RUNTIME_BINDING_MISMATCH")
+        if binding.result_repo != getattr(self.adapter.router, 'configured_result_repo', None):
+            raise IntegrationError('RUNTIME_BINDING_MISMATCH')
         if binding.workspace != self.adapter.workspace or binding.prompt_sha256 != digest(self.adapter.config.system_prompt.encode()):
             raise IntegrationError("RUNTIME_BINDING_MISMATCH")
         await self.adapter.on_started(self.adapter.display_name, "Scoped factory seat")

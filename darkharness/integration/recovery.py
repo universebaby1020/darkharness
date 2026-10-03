@@ -159,7 +159,9 @@ class Recovery:
         return dict(parent)
 
     def _quiescent(self):
-        root = self.broker.root
+        # Git source may be a narrowed result repo, but native effects still
+        # occupy the full workspace. Never weaken cessation when splitting them.
+        root = Path(self.router.workspace)
         allowed = self.idle_client_pids() | {os.getpid()}
         # Validate owned client identities first; don't turn unrelated WSL
         # nondumpable processes into a global /proc approval prerequisite.

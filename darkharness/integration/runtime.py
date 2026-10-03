@@ -40,4 +40,4 @@ class DurableRuntime:
         return {**row, "effective_settings": settings.evidence() if settings else None}
 
     async def collect(self, operation):
-        return {"work": await self.status(operation), "git": git_evidence(self.adapter.workspace)}
+        return {"work": await self.status(operation), "git": git_evidence(self.adapter.git_broker.root)}

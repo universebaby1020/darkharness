@@ -3,6 +3,7 @@
 The owner store and its event artifacts are authoritative (not a sandbox against
 same-UID tampering). Generic Recovery remains independent of SDK error strings.
 """
+from copy import deepcopy
 from importlib.metadata import version
 import json
 from pathlib import Path
@@ -12,6 +13,43 @@ from .mailbox import IntegrationError, Mailbox, digest, encode
 from .recovery import Recovery
 
 SDK_SHA256 = 'b3738db2e31376726e7edbe953c5f3ac5e26f2681066fb20a109a8a819529a4c'
+
+
+def prepare_settled_timeout_recovery(scope, *, run_id, workspace, rooms, seats):
+    """Pure controller preparation of a NEW Grant scope, before run.start.
+
+    Pass the returned scope to the existing authenticated grant.record route.
+    This helper does not issue authority, write a Store, read credentials, choose
+    a room cursor, start a run or resume work. The caller owns the fresh state/run
+    and Grant lifecycle; passing a scope does not prove that lifecycle happened.
+    Automatic recovery still requires all canonical SDK terminal/progress proofs.
+    Explicit subsets only: never widen the controller's parent rooms or seats.
+    """
+    def identifiers(values):
+        return (isinstance(values, list) and bool(values) and
+                all(isinstance(v, str) and v.strip() == v and v and
+                    not any(c in v for c in '\r\n\0') for v in values) and
+                len(values) == len(set(values)))
+
+    if (not isinstance(scope, dict) or not isinstance(run_id, str) or not run_id or
+            run_id.strip() != run_id or any(c in run_id for c in '\r\n\0') or
+            scope.get('run_id') != run_id):
+        raise IntegrationError('TIMEOUT_PREPARATION_RUN_MISMATCH')
+    if (not isinstance(workspace, str) or not workspace or
+            not Path(workspace).is_absolute() or '..' in Path(workspace).parts or
+            str(Path(workspace).resolve()) != workspace or scope.get('workspace') != workspace):
+        raise IntegrationError('TIMEOUT_PREPARATION_WORKSPACE_MISMATCH')
+    if (not identifiers(rooms) or not identifiers(seats) or
+            not identifiers(scope.get('rooms')) or not identifiers(scope.get('seats')) or
+            not set(rooms) <= set(scope['rooms']) or not set(seats) <= set(scope['seats'])):
+        raise IntegrationError('TIMEOUT_PREPARATION_SCOPE_MISMATCH')
+    cap = {'enabled': True, 'run_id': run_id, 'workspace': workspace,
+           'rooms': list(rooms), 'seats': list(seats)}
+    if 'settled_timeout_recovery' in scope and scope['settled_timeout_recovery'] != cap:
+        raise IntegrationError('TIMEOUT_PREPARATION_CONFLICT')
+    prepared = deepcopy(scope)
+    prepared['settled_timeout_recovery'] = cap
+    return prepared
 
 
 def terminal_evidence(db, parent, router):

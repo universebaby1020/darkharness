@@ -42,10 +42,34 @@ def regular_path(root, rel):
     return p
 
 
+def result_repo_boundary(workspace, result_repo=None):
+    """Explicit repository below the existing workspace ceiling; None is legacy.
+
+    No filesystem creation or repository discovery. Sibling repositories are not
+    authority for this broker. Reject links and an enclosing Git repository.
+    """
+    ceiling = Path(workspace)
+    if result_repo is None:
+        return ceiling
+    if not isinstance(result_repo, str) or not result_repo or '\0' in result_repo:
+        raise IntegrationError('RESULT_REPO_CANONICAL_REQUIRED')
+    root = Path(result_repo)
+    if (not ceiling.is_absolute() or ceiling != ceiling.resolve() or
+            not root.is_absolute() or str(root) != result_repo or '..' in root.parts or
+            root != root.resolve() or root == ceiling or not root.is_relative_to(ceiling)):
+        raise IntegrationError('RESULT_REPO_OUTSIDE_WORKSPACE_OR_NONCANONICAL')
+    for p in [root, *root.parents]:
+        if p.is_symlink():
+            raise IntegrationError('RESULT_REPO_SYMLINK_DENIED')
+        if p != root and p.is_relative_to(ceiling) and (p / '.git').exists():
+            raise IntegrationError('RESULT_REPO_NESTED_DENIED')
+    return root
+
+
 class LocalGitBroker:
     def __init__(self, mailbox, router, actor, email, assigned_workspace):
         self.box, self.router, self.owner = mailbox, router, mailbox.owner
-        self.root = Path(router.workspace)
+        self.root = result_repo_boundary(router.workspace, getattr(router, 'configured_result_repo', None))
         self.assigned = Path(assigned_workspace).resolve()
         if not self.root.is_relative_to(self.assigned) or not actor or any(c in actor for c in '\n\r\x00<>') or not re.fullmatch(r'[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+\.invalid', email):
             raise IntegrationError('ACTOR_WORKSPACE_INVALID')

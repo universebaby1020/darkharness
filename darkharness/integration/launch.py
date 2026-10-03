@@ -15,6 +15,7 @@ from .mailbox import IntegrationError, Mailbox, digest, encode
 from .policy import ApprovalRouter
 from .legacy_git_origin import execution_ledger_run
 from .contract import BackendRegistration, RuntimeBinding, SeatSettings
+from .git_broker import result_repo_boundary
 
 
 def _fields(value, allowed, location):
@@ -72,7 +73,11 @@ def resolve_settings(config):
     _fields(config, {"run_id", "room_id", "workspace", "credentials_path", "grant_id",
                     "model", "effort", "codex_command", "runtime_env", "turn_timeout_s",
                     "seats", "runtime", "connections", "default_connection",
-                    "auto_recover_settled_timeouts"}, "run")
+                    "auto_recover_settled_timeouts", "result_repo"}, "run")
+    result_repo = config.get('result_repo')
+    if 'result_repo' in config:
+        _text(result_repo, 'run.result_repo')
+        result_repo_boundary(config['workspace'], result_repo)
     run_runtime = _text(config.get("runtime", "codex"), "run.runtime")
     if run_runtime not in BACKENDS:
         raise IntegrationError("UNSUPPORTED_RUNTIME:run")
@@ -172,9 +177,11 @@ def resolve_settings(config):
         env = profile.get("runtime_env", config.get("runtime_env", {}) if runtime == run_runtime else {})
         sources["command"] = "run" if legacy or "command" not in profile else "connection"
         sources["runtime_env"] = ("run" if "runtime_env" in config else "empty_default") if legacy else "connection" if "runtime_env" in profile else "run" if runtime == run_runtime and "runtime_env" in config else "empty_default"
+        if result_repo is not None:
+            sources['result_repo'] = 'run'
         settings.append(SeatSettings(name, runtime, str(Path(config["workspace"]).resolve()),
                                     values["model"], values["effort"], values["turn_timeout_s"],
-                                    tuple(command), tuple(sorted(env.items())), tuple(sorted(sources.items()))))
+                                    tuple(command), tuple(sorted(env.items())), tuple(sorted(sources.items())), result_repo))
     return tuple(settings)
 
 
@@ -208,7 +215,10 @@ def validate_config(config):
     workspace = Path(config["workspace"])
     if not workspace.is_absolute() or not workspace.is_dir():
         raise IntegrationError("ABSOLUTE_WORKSPACE_REQUIRED")
-    if not (workspace / ".git").exists():
+    if 'result_repo' in config:
+        _text(config['result_repo'], 'run.result_repo')
+    repo = result_repo_boundary(config['workspace'], config.get('result_repo'))
+    if not repo.is_dir() or not (repo / '.git').is_dir() or (repo / '.git').is_symlink():
         raise IntegrationError("SCOPED_GIT_REPO_REQUIRED")
     credential = Path(config["credentials_path"])
     if not credential.is_absolute() or credential.resolve().is_relative_to(workspace.resolve()):
@@ -245,7 +255,7 @@ def prepare(config, official_root, python="python3"):
         if effective.runtime != "codex":
             BACKENDS[effective.runtime].preflight(effective)
     guard = SecretGuard.official(official_root, python)
-    folder = Path(config["workspace"]) / "mandates"
+    folder = result_repo_boundary(config['workspace'], config.get('result_repo')) / 'mandates'
     folder.mkdir(exist_ok=True)
     hashes = {}
     for seat, effective in zip(config["seats"], settings):
@@ -257,7 +267,7 @@ def prepare(config, official_root, python="python3"):
             raise IntegrationError("EXISTING_MANDATE_MISMATCH")
         path.write_bytes(raw)
         hashes[seat["alias"]] = digest(raw)
-    checks = mandate_checks(official_root, config["workspace"], python)
+    checks = mandate_checks(official_root, folder.parent, python)
     if any(checks.values()):
         raise IntegrationError("MANDATE_OFFICIAL_CHECK_FAILED")
     return {"level": "COMPONENT_PRECHECK", "snapshots": hashes, "official_mandates": checks,
@@ -306,11 +316,11 @@ class SeatManager:
         try:
             bindings = []
             for seat, effective in zip(config["seats"], settings):
-                router = ApprovalRouter(self.owner, config["grant_id"], seat["alias"], config["room_id"], config["run_id"], config["workspace"])
+                router = ApprovalRouter(self.owner, config["grant_id"], seat["alias"], config["room_id"], config["run_id"], config["workspace"], result_repo=effective.result_repo)
                 if not router.active():
                     raise IntegrationError("CONTROLLER_GRANT_REQUIRED")
                 text = render_mandate(seat["display_name"], seat["role"], BACKENDS[effective.runtime].harness, effective.model, effective.effort)
-                mandate = Path(config["workspace"]) / "mandates" / (slug(seat["display_name"]) + ".md")
+                mandate = Path(router.result_repo) / "mandates" / (slug(seat["display_name"]) + ".md")
                 snapshot_check(text, mandate.read_bytes(), digest(text.encode()))
                 ident, credential = load_agent_config(seat["alias"], config_path=path)
                 guard.register_known(credential)
@@ -492,6 +502,8 @@ def _codex_preflight(settings):
 
 
 def _codex_factory(*, settings, seat, config, text, mailbox, router, guard, coordinator):
+    if settings.result_repo != getattr(router, 'configured_result_repo', None):
+        raise IntegrationError('RESULT_REPO_BINDING_MISMATCH')
     from .codex import CodexRuntime, DurableCodexAdapter
     sdk_config = codex_sdk_config(settings, config["room_id"], text, seat["display_name"])
     adapter = DurableCodexAdapter(mailbox=mailbox, router=router, guard=guard,
@@ -508,7 +520,7 @@ def _codex_factory(*, settings, seat, config, text, mailbox, router, guard, coor
         ("same-UID credential access possible", "Docker/interop not an isolation boundary",
          "privileged shell wrappers denied", "SDK platform ACK is not exactly-once"),
         settings.turn_timeout_s, digest(text.encode()), settings.connection,
-        settings.model, settings.effort, settings.fingerprint, settings.sources)
+        settings.model, settings.effort, settings.fingerprint, settings.sources, settings.result_repo)
     adapter.binding = binding
     return adapter, CodexRuntime(adapter), binding
 
@@ -551,13 +563,15 @@ def _claude_preflight(settings):
 
 
 def _claude_factory(*, settings, seat, config, text, mailbox, router, guard, coordinator):
+    if settings.result_repo != getattr(router, 'configured_result_repo', None):
+        raise IntegrationError('RESULT_REPO_BINDING_MISMATCH')
     from .claude import DurableClaudeAdapter, ClaudeRuntime
     binding = RuntimeBinding(settings.runtime, 'UNQUALIFIED', settings.workspace,
         'workspace-scoped-native-tools', 'controller-grant/on-request', 'native-controlled',
         ('same-UID credential access possible', 'native CLI execution qualification NOT_RUN',
          'SDK platform ACK is not exactly-once', 'optional Linux transport and SDK versions pinned'),
         settings.turn_timeout_s, digest(text.encode()), settings.connection, settings.model,
-        settings.effort, settings.fingerprint, settings.sources)
+        settings.effort, settings.fingerprint, settings.sources, settings.result_repo)
     adapter = DurableClaudeAdapter(settings=settings, binding=binding,
         config=claude_sdk_config(settings, text, seat['display_name']), mailbox=mailbox,
         router=router, guard=guard, alias=seat['alias'], display_name=seat['display_name'],
@@ -569,7 +583,7 @@ def _claude_factory(*, settings, seat, config, text, mailbox, router, guard, coo
 # Only trusted controller code may extend this registry. JSON selects a name;
 # it cannot supply a callable, Python import, permission policy or plugin.
 BACKENDS = {
-    "codex": BackendRegistration("DarkHarness (Band SDK Codex)", "0.159.3",
+    "codex": BackendRegistration("Codex (DarkHarness Band SDK adapter)", "0.159.3",
         frozenset({"PATH", "CODEX_HOME"}), _codex_preflight, _codex_factory),
     "claude_code": BackendRegistration("DarkHarness (Band SDK Claude Code)", "UNQUALIFIED",
         frozenset({"PATH", "CLAUDE_CONFIG_DIR"}), _claude_preflight, _claude_factory),
