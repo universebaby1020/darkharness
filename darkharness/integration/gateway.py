@@ -198,6 +198,16 @@ class IntegrationSession(Session):
                 if not isinstance(cap, dict):
                     raise Rejected('TYPED_GIT_GRANT_REQUIRED')
             return self.response(req, data=recovery.broker.reconcile(payload['effect_id']))
+        if action == 'integration.capacity.recover':
+            if set(payload) != {'attempt', 'grant_id'}:
+                raise Rejected('INVALID_RECOVERY_PAYLOAD')
+            from .codex_capacity import CodexCapacityRecovery
+            base = service.recovery(req['operation_id'], payload['grant_id'])
+            recovery = CodexCapacityRecovery(base.box, base.router, base.broker, base.idle_client_pids)
+            result = recovery.recover(req['operation_id'], payload['attempt'])
+            if manager.agents:
+                result['wake_job_id'] = service.submit(manager.wake_continuation(result['id']))
+            return self.response(req, data=result)
         if action in {'integration.reconcile', 'integration.timeout.recover'}:
             if set(payload) != {'attempt', 'grant_id'}:
                 raise Rejected('INVALID_RECOVERY_PAYLOAD')
