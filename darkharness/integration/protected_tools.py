@@ -11,6 +11,11 @@ class LocalSendRejected(IntegrationError):
     """Pure preflight rejection; no external boundary has been crossed."""
 
 
+# Band SDK 4.0.0 ChatEventRequest documents this platform serialized-byte cap.
+# It belongs to the SDK send boundary, not the run/Grant or Core scheduler.
+SDK4_EVENT_METADATA_MAX_BYTES = 65536
+
+
 def validate_local_send(raw, method, body):
     # Pinned SDK4 resolver and Fern models, not string-based exception inference.
     from band.runtime.tools.agent import AgentTools
@@ -27,7 +32,14 @@ def validate_local_send(raw, method, body):
             resolved = AgentTools._resolve_required_mentions(raw, mentions)
             ChatMessageRequest(content=body['content'], mentions=[ChatMessageRequestMentionsItem(**m) for m in resolved])
         elif method == 'send_event':
-            ChatEventRequest(**body)
+            request = ChatEventRequest(**body)
+            metadata = request.model_dump(mode='json', exclude_unset=True).get('metadata')
+            if metadata is not None:
+                # JSON escaping and UTF-8 expansion count too. The SDK diff
+                # value cap alone does not bound the containing metadata object.
+                serialized = json.dumps(metadata, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+                if len(serialized) > SDK4_EVENT_METADATA_MAX_BYTES:
+                    raise LocalSendRejected('LOCAL_EVENT_METADATA_TOO_LARGE')
         if not has_visible_content(body['content']):
             raise LocalSendRejected('LOCAL_SEND_VALIDATION_REJECTED')
     except (ValueError, TypeError, AttributeError, BandToolError, ValidationError):
@@ -103,16 +115,30 @@ class GuardedTools:
         old = self.adapter.mailbox.prepare_send(identifier, self.operation, body)
         if old is not None:
             return old
+        phase = 'RAW_SEND'
         try:
             result = await getattr(self.raw, method)(**body)
+            phase = 'RECEIPT_SERIALIZE'
             receipt = serialize_tool_result(result)
+            phase = 'RECEIPT_VALIDATE'
             if receipt is None:
                 raise IntegrationError("SEND_ACK_MISSING")
+            phase = 'RECEIPT_GUARD'
             self.adapter.guard.require_clean(receipt)
+            phase = 'MAILBOX_SENT'
             self.adapter.mailbox.sent(identifier, receipt)
             return result
-        except BaseException:
-            self.adapter.mailbox.observe(self.operation, self.attempt, "DELIVERY_UNKNOWN", {"outbox_id": identifier})
+        except BaseException as exc:
+            # Keep the fence for every crossed-boundary uncertainty, including
+            # cancellation. Never log exception text, request, headers or body.
+            status = getattr(exc, 'status_code', None)
+            if status is None:
+                status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            status = status if type(status) is int and 100 <= status <= 599 else None
+            diagnostic = self.adapter.guard.sanitize({'outbox_id': identifier,
+                'method': method, 'phase': phase,
+                'exception_class': type(exc).__name__, 'http_status': status})
+            self.adapter.mailbox.observe(self.operation, self.attempt, "DELIVERY_UNKNOWN", diagnostic)
             raise
 
     async def send_message(self, content, mentions=None):

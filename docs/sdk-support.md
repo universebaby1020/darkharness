@@ -39,6 +39,28 @@ SHA-256 (copied reference and installed source byte-identical):
 
 ## Launch interface
 
+### Event metadata and uncertain sends
+
+The pinned SDK 4.0.0 `ChatEventRequest` contract caps event metadata at
+65,536 serialized JSON bytes. A diff value capped at 65,536 UTF-8 bytes can
+still exceed that envelope once JSON escaping and the other fields are added.
+The protected send boundary now checks the complete compact UTF-8 JSON metadata
+before creating `SEND_INTENT` or calling the SDK. An oversized event receives
+`LOCAL_EVENT_METADATA_TOO_LARGE` and a `REJECTED` local receipt, never a false
+delivery acknowledgment. The SDK's best-effort event caller can finish its turn
+and the next queued task can start. No source content is trimmed or resent.
+
+After an external call begins, failures retain `DELIVERY_UNKNOWN`. Diagnostics
+record only the method, failure phase, exception class and available HTTP status;
+exception text, headers and response bodies are excluded. A stored event with a
+lost response remains fenced, as do missing acknowledgments, receipt guard
+failures, failed receipt persistence and cancellation. This change does not add
+room readback, automatic acknowledgment, or recovery of historical unknown sends.
+
+Validation includes actual SDK diff forwarding and next-task draining against
+synthetic native and Band transports; it is component evidence, not a live Band
+or model qualification.
+
 Use a committed source snapshot and the SDK-pinned Linux virtual environment. Keep run configuration, credentials and state outside the public source/result workspace. `run.example.json` contains placeholders only. Alias, display name, participant ID and typed mention ID are separate identities; IDs are never derived from aliases. Model/effort come from run configuration, not role assignment.
 
 ```text
