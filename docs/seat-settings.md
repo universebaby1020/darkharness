@@ -1,12 +1,16 @@
 # 좌석별 연결·모델·effort·시간제한
 
 기존 진단의 모델·인증·실행 환경은 변경하지 않는다. 이 기능은 사용자가 **후속 run**에서 선택한 설정을 적용한다. 역할과 연결, 모델은 별개이며 역할별 모델 표나 공급자 fallback은 없다. GUI/설치기는 이 범위에 없다.
+선택적 result_repo·timeout 준비·진단·guard와 판본별 검증 수준은 [WO04 공개 factory 계약](wo04-factory-contract.md)을 따른다.
 
 ## 설정과 우선순위
 
 기존 `run.example.json`의 flat `model`, `effort`, `codex_command`, `runtime_env`는 그대로 `legacy` Codex 연결로 해석한다. `turn_timeout_s` 생략 기본값은 **3600초**다.
 
 새 JSON 필드:
+
+- `result_repo`: 선택적 명시 canonical 절대경로. 실제 workspace 하위의 독립 Git repo를 config와 기존 Grant scope에 동일하게 등록한다. workspace native cwd/권한 상한은 그대로이며, 생략하면 기존처럼 같은 root를 쓴다. local_git_write 경로 capability는 결과 repo 상대경로다.
+- `auto_recover_settled_timeouts`: default-off. true 명시와 같은 run/workspace 및 허용 room/seat의 Grant capability가 함께 필요하다. 순수 `prepare_settled_timeout_recovery(scope, *, run_id, workspace, rooms, seats)` 반환 scope는 run 시작 전 기존 `grant.record`로 등록한다. helper는 lifecycle/admission 보장이 아니며 기존 SDK terminal proof와 UNKNOWN fence를 유지한다.
 
 - `connections.<name>`: 필수 `runtime`, 선택적 `command`, `runtime_env`, `model`, `effort`, `turn_timeout_s`. runtime은 등록된 `codex` 또는 `claude_code`. 모델이 보낸 import/plugin/callable/권한 정책을 설정으로 받을 수 없다.
 - `default_connection`: 좌석에서 참조를 생략했을 때 사용할 이름. profiles를 선언한 경우 기본 연결을 추정하지 않는다.
@@ -66,7 +70,7 @@ python -B -m darkharness.integration prepare --config <external-json> --official
 
 `prepare`는 effective binding에 맞는 정확한 Model/effort/Harness mandate를 생성한다. optional backend 실패는 mandate 쓰기 전에 발생한다. 기존 Codex prepare는 의존성/인증 없이 가능하다. startup은 caller JSON을 deepcopy하고 모든 backend를 preflight한 뒤 credentials/Agent/room을 다룬다.
 
-`SeatSettings`는 frozen tuple 기반이다. fingerprint는 connection 이름, runtime, canonical workspace, model, effort, timeout, command, env를 포함하고 **설정 출처는 제외**한다. 생략한 기본값과 같은 explicit 값은 실행 의미가 같다. `RuntimeBinding`도 출처만 다른 경우 동등하다. 같은 run의 seat identity/role/room/effective fingerprint는 Store의 `c_run_settings`에 고정하며 재시작 때 변경을 거절한다. 다른 값을 선택하려면 새 run identity를 사용한다. 모델 output/룸 command로 설정을 바꾸거나 승인을 추론하지 않는다.
+`SeatSettings`는 frozen tuple 기반이다. fingerprint는 connection 이름, runtime, canonical workspace, model, effort, timeout, command, env 및 명시된 result_repo를 포함하고 **설정 출처는 제외**한다. result_repo 생략 시 기존 fingerprint 형식을 유지한다. 생략한 기본값과 같은 explicit 값은 실행 의미가 같다. `RuntimeBinding`도 출처만 다른 경우 동등하다. 같은 run의 seat identity/role/room/effective fingerprint는 Store의 `c_run_settings`에 고정하며 재시작 때 변경을 거절한다. 다른 값을 선택하려면 새 run identity를 사용한다. 모델 output/룸 command로 설정을 바꾸거나 승인을 추론하지 않는다.
 
 Thread/session 선택은 run/room/seat **및 binding fingerprint**를 확인한다. 다른 runtime/auth connection/모델/timeout의 session이나 미확인 legacy session은 resume하지 않는다. 자기 durable 원래 작업·결과·실제 peer answer는 context/evidence로 보존하고, 과거 도구 효과를 replay하지 않는다. Codex의 기존 native history/toolset cutover를 유지한다. Claude는 schema/mandate가 바뀌면 자기 durable history artifact를 연결하고 새 native session을 쓴다. 구현 source hash는 별도 provenance이며 source만 바뀌었다고 compatible session을 버리지 않는다.
 

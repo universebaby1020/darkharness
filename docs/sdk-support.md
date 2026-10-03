@@ -1,6 +1,7 @@
 # Band SDK 4.0.0 support
 
 좌석별 연결/runtime/model/effort/timeout은 [새 설정 API](seat-settings.md)를 따른다.
+새 B의 선택적 result_repo·순수 timeout 준비 helper·재시도 진단·guard 범위와 현재 검증 수준은 [WO04 공개 factory 계약](wo04-factory-contract.md)을 따른다.
 기존 flat Codex 설정과 아래 diagnostic/복구 메커니즘은 유지한다. 선택형
 Claude Code는 실제 protected factory/SDK component 경로가 있으나 실제 inference
 qualification은 NOT_RUN이다. 과거 repair 범위의 fixed-runtime 설명은 후속 run의
@@ -46,7 +47,7 @@ python -B -m darkharness.integration prepare --config <external-run-config> --of
 python -B -m darkharness.integration.gateway --state-root <linux-state-root> --official-root <external-official-checkout> --official-python <python>
 ```
 
-`prepare` writes mandates in the configured result repo without reading credentials. It runs the external official toy/tablekeeper mandate checks, not the full competition qualification. `Model:` contains the exact model ID; effort is separate. Harness label `DarkHarness (Band SDK Codex)` identifies this custom runtime, not a claim about native UI labels.
+`prepare` writes mandates in the configured result repo without reading credentials. It runs the external official toy/tablekeeper mandate checks, not the full competition qualification. `Model:` contains the exact model ID; effort is separate. Harness label `Codex (DarkHarness Band SDK adapter)` identifies this custom runtime, not a claim about native UI labels.
 
 The Host Bridge must launch the integration gateway module (not a second service) using an argv array. Retain B's framed protocol envelope and controller hello. Controller sequence:
 
@@ -84,16 +85,17 @@ Native 설정은 계속 `workspace-write` / `on-request`다. `/bin/bash -lc 'git
 - `dh_local_git_commit`: `{cwd, paths, message, expected_head}`. Seat가 이미 작성한 regular files만 읽어 Git plumbing으로 커밋한다. Author/committer는 설정된 seat 이름과 `.invalid` 주소다. 별도 commit index로 무관한 staged 변경을 제외하고, 실제 index의 선택 경로만 index lock/CAS로 맞춘다. Ref도 기대 HEAD로 CAS한다. Hooks, filters, fsmonitor, signing, global config, shell, network, amend/merge/rebase는 실행하지 않는다.
 - `dh_review_snapshot`: `{cwd, revision, name}`. 정확한 40-hex commit의 독립 shallow checkout을 새 scratch 하위 디렉터리에 만든다. 원 저장소의 객체를 hardlink하지 않고, remote/config를 복사하지 않는다. Pinned tree의 파일 수·바이트 수와 object bytes를 측정하고 복사 후 tree/파일 bytes를 대조한다. 명시된 `max_bytes` / `max_files`가 있으면 추가로 검사하며, 필수 영구 예산값은 아니다.
 
-기존 authenticated `grant.record`의 scope에 다음 capability를 더한다. Seat payload는 Grant가 아니다. `workspace`는 실제 canonical result repo이며, `.git`, 경로 이탈, symlink, nested repo 및 gitlink tree는 허용하지 않는다. 디렉터리 범위 `.`은 승인된 repo의 일반 파일을 뜻한다. 파일명마다 새 human 승인을 요구하지 않는다. Reviewer scratch는 source commit 범위에서 제외된다.
+기존 authenticated `grant.record`의 scope에 다음 capability를 더한다. Seat payload는 Grant가 아니다. 선택적 명시 `result_repo`는 실제 canonical workspace 하위의 독립 Git repo이며 config와 Grant scope에 동일하게 등록한다. `workspace`는 native cwd/권한 상한을 유지한다. 명시 result가 없으면 기존처럼 같은 root를 쓴다. 아래 예시는 result를 명시한 scope이며 typed Git cwd와 local_git_write 경로 capability는 결과 repo 기준이다. `.git`, 경로 이탈, symlink, nested repo 및 gitlink tree는 허용하지 않는다. 디렉터리 범위 `.`은 승인된 repo의 일반 파일을 뜻한다. 파일명마다 새 human 승인을 요구하지 않는다. Reviewer scratch는 source commit 범위에서 제외된다.
 
 ```json
 {
   "run_id": "<same run>",
-  "workspace": "<canonical result repo>",
+  "workspace": "/workspace",
+  "result_repo": "/workspace/result",
   "seats": ["<configured seat aliases>"],
   "rooms": ["<existing room id>"],
   "local_git_write": {"directories": ["."], "paths": []},
-  "review_snapshot": {"scratch": "<canonical result repo>/.review"},
+  "review_snapshot": {"scratch": "/workspace/result/.review"},
   "continuation": {"operations": ["<known interrupted/yielded/returned parent id>"]}
 }
 ```
@@ -124,7 +126,7 @@ Same-UID tampering은 OS 격리라고 주장하지 않는다. Source fingerprint
 - SDK4의 `TurnResultAlreadyReported`는 timeout 자체가 아니다. `codex_timeout.py`는 설치 SDK4 Codex 소스 hash를 pin하고, canonical store에서 정확한 operation/attempt/own thread/turn/client, workspace-write/on-request native turn 시작, SDK failed timeout outcome, controller interrupt 요청/ACK, native interrupted terminal(error=null), 동일 owned client의 PROCESS_STOPPED(members=[]) 순서를 모두 검증한다. 일반 runtime 계약과 SDK-specific detection은 분리된다. 오류 문자열 하나나 seat의 safe 주장은 정산 근거가 아니다.
 - 같은 seat의 outbox가 전부 ACKED/REJECTED이고 모든 Git effect가 ACKED여야 한다. 취소·pending 질문/approval/callback/checker, native 외부 효과 불명, owned process 잔존, unresolved run, STOP/revoke는 차단한다. 두 번의 canonical repo/index/source readback과 immutable Git candidate/receipt/index artifact/object readback이 일치해야 한다. 여러 commit은 실제 parent/tree/ref/identity와 연속 chain을 확인하며 마지막 ACKed commit/index만 현재 HEAD/index와 일치시킨다. unrelated HEAD는 허용하지 않는다.
 - 성공한 정산은 `SETTLED_TURN_TIMEOUT`과 FAILED/RECONCILED 결과를 남기며 acceptance는 NOT_EVALUATED다. 원 full input/own thread/commit/ACK receipt를 보존해 단일 continuation을 생성한다. 기존 ACKed send payload hash는 canonical recovery proof/readback으로 재사용하며 외부 전송하지 않는다. 실패 native command exit는 native_failures에 남긴다. telemetry ACK나 같은 handoff 반복은 진행으로 세지 않는다. source 변화/새 ACKed handoff/새 authenticated question/checker 결과 진전 없이 연속 timeout이면 TIMEOUT_NO_PROGRESS다. 새 시간/횟수 ceiling은 없으며 기존 turn_timeout_s 설정키는 유지한다. 당시 SDK 기본/실제 관측180.0초와 현재 사용자 지정 integration 기본3600.0초는 구분한다.
-- 자동 복구는 default-off다. 외부 run config에 `auto_recover_settled_timeouts: true`, Controller Grant scope에 `settled_timeout_recovery: {enabled:true,run_id:<정확한 run>,workspace:<canonical workspace>,rooms:[<정확한 room>],seats:[<허용 alias들>]}`를 함께 설정한다. 외부 scope와 모든 바인딩이 일치해야 한다. 새 정상 peer task는 authenticated inbox로, 자식은 실제 c_recovery/c_question/c_verification_continuation 및 hash-verified known result로 원 inbox 계보를 검증한다. input.parent_operation만 믿지 않는다. 기존 continuation.operations는 수동 maintenance용으로 유지한다.
+- Controller는 run 시작 전에 순수 `prepare_settled_timeout_recovery(scope, *, run_id, workspace, rooms, seats)`의 반환 scope를 기존 인증된 `grant.record`에 등록할 수 있다. helper는 부모 run/workspace 일치와 room/seat 부분집합을 검사할 뿐 Grant 발급·Store 기록·run lifecycle·기존 방 admission을 보장하지 않는다. 자동 복구는 default-off다. 외부 run config에 `auto_recover_settled_timeouts: true`, Controller Grant scope에 `settled_timeout_recovery: {enabled:true,run_id:<정확한 run>,workspace:<canonical workspace>,rooms:[<정확한 room>],seats:[<허용 alias들>]}`를 함께 설정한다. 외부 scope와 모든 바인딩이 일치해야 한다. 새 정상 peer task는 authenticated inbox로, 자식은 실제 c_recovery/c_question/c_verification_continuation 및 hash-verified known result로 원 inbox 계보를 검증한다. input.parent_operation만 믿지 않는다. 기존 continuation.operations는 수동 maintenance용으로 유지한다.
 - live 예외 처리와 readiness 이전 startup이 같은 검증을 재사용한다. 초기 사용자 dispatch를 다시 보내거나 운영 SQLite를 직접 편집할 필요가 없다. maintenance stop과 genuine run STOP은 다르며 STOP/revoke를 지워 복구하지 않는다. Controller `integration.reconcile` payload는 `{attempt,grant_id}`이고 검증된 timeout 정산만 수행한다. `integration.timeout.recover`는 같은 payload로 정산+continuation/wake를 수행한다. 임의 receipt/evidence_refs 입력은 거절한다. Event/result의 evidence_refs는 controller가 canonical store에서 생성한 seq+artifact hash다.
 - owner store/현재 Grant/native-controlled sandbox가 신뢰 경계다. same-UID 공격자에 대한 OS 격리나 외부 Docker/network cleanup 증명이 아니다. WSL SDK stdio/component 시험과 실제 운영 재개·toy acceptance는 구분한다.
 
