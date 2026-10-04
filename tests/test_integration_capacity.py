@@ -32,6 +32,7 @@ class CapacityTests(unittest.TestCase):
         self.box.claim(self.op, 'a')
         self.box.update(self.op, 'a', state='PAUSED', delivery='DELIVERY_UNKNOWN', thread='thread')
         self.owner.grant(self.root, continuation={'operations': [self.op]})
+        self.prepare_repo()
         self.router = ApprovalRouter(self.owner, 'g', 's', 'r', 'run', self.root)
         self.broker = LocalGitBroker(self.box, self.router, 'fixture', 'fixture@actors.invalid', self.root)
         ThreadOwnership(self.box, self.router, binding='fixture-settings').bind('thread', 'compatibility')
@@ -51,6 +52,9 @@ class CapacityTests(unittest.TestCase):
             'sha256': 'source', 'head': 'head', 'identity': 'identity', 'ref': 'ref',
             'indexed_entries': [], 'files': []}).start()
         self.trace()
+
+    def prepare_repo(self):
+        pass
 
     def record(self, kind, body):
         self.box.observe(self.op, 'a', kind, body)
@@ -385,6 +389,8 @@ class CapacityLinuxTests(CapacityTests):
     def setUp(self):
         super().setUp()
         patch.stopall()
+
+    def prepare_repo(self):
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
         (self.root / 'base').write_text('fixture source')
         subprocess.run(['git', '-C', str(self.root), 'add', 'base'], check=True)

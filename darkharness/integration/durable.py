@@ -58,6 +58,8 @@ class DurableSeatMixin:
             except (KeyError, TypeError):
                 raise IntegrationError("HANDOFF_SHAPE_INVALID") from None
         self.mailbox.receive(self.alias, room_id, msg.sender_id, msg.id, content, envelope=envelope, part=part)
+        from .provider_recovery import bind_dispatch
+        bind_dispatch(self.mailbox, self.router, msg)
         await self._hydrate_startup_tools(tools)
         self._wake()
         # No await of the model turn or peer reply on the Band room dispatch lane.

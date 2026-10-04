@@ -54,6 +54,7 @@ class Mailbox:
             "CREATE TABLE IF NOT EXISTS c_control_receipt(seat TEXT,room TEXT,sender TEXT,platform_id TEXT,hash TEXT,PRIMARY KEY(seat,room,sender,platform_id))",
             "CREATE TABLE IF NOT EXISTS c_callback(operation TEXT,attempt TEXT,id TEXT,hash TEXT,PRIMARY KEY(operation,attempt,id))",
             "CREATE TABLE IF NOT EXISTS c_thread_tools(thread TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS c_retry_wait(operation TEXT PRIMARY KEY, failures INTEGER NOT NULL, not_before REAL NOT NULL)",
             "CREATE TABLE IF NOT EXISTS c_event(seq INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT, kind TEXT, body TEXT, at TEXT)",
         ]
         with owner.transaction(owner.epoch) as db:
@@ -149,7 +150,7 @@ class Mailbox:
                 return None
             if db.execute("SELECT 1 FROM c_work WHERE seat=? AND delivery IN ('DISPATCHING','STARTED','DELIVERY_UNKNOWN')", (seat,)).fetchone():
                 return None
-            row = db.execute("SELECT w.* FROM c_work w LEFT JOIN c_inbox i ON i.work=w.id WHERE w.seat=? AND w.delivery='READY' AND w.state='QUEUED' GROUP BY w.id ORDER BY MIN(i.seq),w.id LIMIT 1", (seat,)).fetchone()
+            row = db.execute("SELECT w.* FROM c_work w LEFT JOIN c_inbox i ON i.work=w.id WHERE w.seat=? AND w.delivery='READY' AND w.state='QUEUED' AND NOT EXISTS (SELECT 1 FROM c_retry_wait r WHERE r.operation=w.id AND r.not_before > CAST(strftime('%s','now') AS REAL)) GROUP BY w.id ORDER BY MIN(i.seq),w.id LIMIT 1", (seat,)).fetchone()
             return dict(row) if row else None
 
     def claim(self, operation, attempt):
@@ -188,11 +189,57 @@ class Mailbox:
                 self.event(db, operation, delivery + "_ACK", {"attempt": attempt})
             return dict(db.execute("SELECT * FROM c_work WHERE id=?", (operation,)).fetchone())
 
+    def release_unstarted(self, operation, attempt, code):
+        from .unstarted import proven_unstarted
+        import time
+        with self.owner.transaction(self.owner.epoch) as db:
+            work = db.execute('SELECT * FROM c_work WHERE id=?', (operation,)).fetchone()
+            if not work or not proven_unstarted(db, work, attempt):
+                return None
+            prior = db.execute('SELECT failures FROM c_retry_wait WHERE operation=?', (operation,)).fetchone()
+            n = (prior[0] if prior else 0) + 1
+            terminal = n >= 3
+            due = time.time() + 60
+            db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (operation, n, due))
+            state, delivery = ('FAILED', 'RETURNED') if terminal else ('QUEUED', 'READY')
+            result = {'effect': 'NOT_STARTED', 'code': code, 'failures': n}
+            db.execute('UPDATE c_work SET state=?,delivery=?,result=? WHERE id=?', (state, delivery, encode(result), operation))
+            db.execute('UPDATE c_inbox SET life=? WHERE work=?', (delivery, operation))
+            self.event(db, operation, 'NOT_STARTED_FAILED' if terminal else 'NOT_STARTED_RELEASED', {'attempt': attempt, **result, 'not_before': due})
+            return {'terminal': terminal, 'backoff_s': 60, **result}
+
+    def notify_peer_blocker(self, operation, attempt, seat, room, run_id):
+        """Evidence-only internal work; never a platform message or retry grant."""
+        with self.owner.transaction(self.owner.epoch) as db:
+            work = db.execute('SELECT * FROM c_work WHERE id=? AND attempt=?', (operation, attempt)).fetchone()
+            if not work or work['seat'] == seat:
+                return None
+            child = digest(encode([run_id, operation, attempt, 'peer-blocker']).encode())
+            evidence = {'operation': operation, 'attempt': attempt, 'seat': work['seat'], 'state': work['state'], 'delivery': work['delivery'], 'result_ref': self.artifact(db, (work['result'] or '{}').encode()), 'replay': 'FENCED'}
+            body = {'content': encode({'peer_blocker': evidence}), 'internal_evidence': True, 'run_id': run_id}
+            db.execute("INSERT OR IGNORE INTO c_work VALUES(?,?,?,?,NULL,'QUEUED','READY',NULL,NULL)", (child, seat, room, encode(body)))
+            self.event(db, operation, 'COORDINATOR_BLOCKER_QUEUED', {'attempt': attempt, 'child': child, 'result_ref': evidence['result_ref']})
+            return child
+
     def recover(self):
         """Observe restart, never replay an in-flight effect."""
         with self.owner.transaction(self.owner.epoch) as db:
             rows = db.execute("SELECT id,attempt FROM c_work WHERE delivery IN ('DISPATCHING','STARTED')").fetchall()
+            from .unstarted import proven_unstarted
             for row in rows:
+                work = db.execute('SELECT * FROM c_work WHERE id=?', (row[0],)).fetchone()
+                if proven_unstarted(db, work, row[1]):
+                    # Cessation must already be durable; owner restart itself is
+                    # NOT evidence that an app-server group stopped.
+                    prior = db.execute('SELECT failures FROM c_retry_wait WHERE operation=?', (row[0],)).fetchone()
+                    n = (prior[0] if prior else 0) + 1
+                    due = datetime.now(timezone.utc).timestamp() + 60
+                    db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (row[0], n, due))
+                    state, delivery = ('FAILED', 'RETURNED') if n >= 3 else ('QUEUED', 'READY')
+                    db.execute('UPDATE c_work SET state=?,delivery=?,result=? WHERE id=?', (state, delivery, encode({'effect': 'NOT_STARTED', 'code': 'OWNER_RESTART', 'failures': n}), row[0]))
+                    db.execute('UPDATE c_inbox SET life=? WHERE work=?', (delivery, row[0]))
+                    self.event(db, row[0], 'NOT_STARTED_RECOVERED', {'attempt': row[1], 'failures': n, 'not_before': due})
+                    continue
                 db.execute("UPDATE c_work SET delivery='DELIVERY_UNKNOWN',state='PAUSED' WHERE id=?", (row[0],))
                 self.event(db, row[0], "DELIVERY_UNKNOWN", {"attempt": row[1], "cause": "owner_restart"})
             return [r[0] for r in rows]
@@ -236,6 +283,15 @@ class Mailbox:
             db.execute("INSERT INTO c_outbox VALUES(?,?,?,'DELIVERY_UNKNOWN',NULL)", (identifier, operation, h))
             self.event(db, operation, "SEND_INTENT", {"id": identifier, "hash": h})
             return None
+
+    def send_not_sent(self, identifier, attempt, code):
+        with self.owner.transaction(self.owner.epoch) as db:
+            row = db.execute('SELECT * FROM c_outbox WHERE id=?', (identifier,)).fetchone()
+            if not row or row['state'] != 'DELIVERY_UNKNOWN':
+                raise IntegrationError('OUTBOX_REJECTION_FENCE')
+            receipt = {'effect': 'NOT_SENT', 'attempt': attempt, 'code': code, 'phase': 'DEFINITIVE_TRANSPORT_REJECTION'}
+            db.execute("UPDATE c_outbox SET state='REJECTED',receipt=? WHERE id=?", (encode(receipt), identifier))
+            self.event(db, row['operation'], 'SEND_REJECTED', {'id': identifier, 'hash': row['hash'], **receipt})
 
     def sent(self, identifier, receipt):
         with self.owner.transaction(self.owner.epoch) as db:

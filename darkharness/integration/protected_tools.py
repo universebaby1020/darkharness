@@ -56,6 +56,32 @@ GIT_TOOLS = {
 }
 
 
+class _SingleSendEndpoint:
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+
+    async def create_agent_chat_message(self, **kwargs):
+        kwargs['request_options'] = {**(kwargs.get('request_options') or {}), 'max_retries': 0}
+        return await self.endpoint.create_agent_chat_message(**kwargs)
+
+    async def create_agent_chat_event(self, **kwargs):
+        kwargs['request_options'] = {**(kwargs.get('request_options') or {}), 'max_retries': 0}
+        return await self.endpoint.create_agent_chat_event(**kwargs)
+
+
+class _SingleSendRest:
+    def __init__(self, rest):
+        self.rest = rest
+
+    @property
+    def agent_api_messages(self):
+        return _SingleSendEndpoint(self.rest.agent_api_messages)
+
+    @property
+    def agent_api_events(self):
+        return _SingleSendEndpoint(self.rest.agent_api_events)
+
+
 class GuardedTools:
     """All SDK send paths and dynamic platform tools pass through this facade.
 
@@ -116,8 +142,17 @@ class GuardedTools:
         if old is not None:
             return old
         phase = 'RAW_SEND'
+        from band.runtime.tools.agent import AgentTools
+        from copy import copy
+        # SDK4 normally hides HTTP retries inside a single durable SEND_INTENT.
+        # Use a call-local facade, never mutate installed SDK or shared raw tools.
+        single_attempt = getattr(type(self.raw), method, None) is getattr(AgentTools, method)
+        sender = self.raw
+        if single_attempt:
+            sender = copy(self.raw)
+            sender.rest = _SingleSendRest(self.raw.rest)
         try:
-            result = await getattr(self.raw, method)(**body)
+            result = await getattr(sender, method)(**body)
             phase = 'RECEIPT_SERIALIZE'
             receipt = serialize_tool_result(result)
             phase = 'RECEIPT_VALIDATE'
@@ -135,6 +170,14 @@ class GuardedTools:
             if status is None:
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
             status = status if type(status) is int and 100 <= status <= 599 else None
+            import httpx
+            from band_rest.core.api_error import ApiError
+            definitive = single_attempt and phase == 'RAW_SEND' and (
+                isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)) or
+                isinstance(exc, (ApiError, httpx.HTTPStatusError)) and status in {400, 403, 404, 413, 422})
+            if definitive:
+                self.adapter.mailbox.send_not_sent(identifier, self.attempt, 'CONNECT_NOT_SENT' if status is None else 'HTTP_REJECTED_' + str(status))
+                raise LocalSendRejected('DEFINITIVE_SEND_NOT_SENT') from None
             diagnostic = self.adapter.guard.sanitize({'outbox_id': identifier,
                 'method': method, 'phase': phase,
                 'exception_class': type(exc).__name__, 'http_status': status})
@@ -142,14 +185,38 @@ class GuardedTools:
             raise
 
     async def send_message(self, content, mentions=None):
-        return await self._send("send_message", {"content": content, "mentions": mentions})
+        # SDK completed-turn proxy reply and internal question export, not the
+        # model's explicit business tool. Redact before crossing the boundary.
+        body = self.adapter.guard.sanitize({'content': content, 'mentions': mentions})
+        try:
+            return await self._send('send_message', body)
+        except IntegrationError as exc:
+            if not isinstance(exc, LocalSendRejected) and str(exc) not in {'GRANT_INACTIVE', 'OUTBOX_SECRET_BLOCKED'}:
+                raise
+            self.adapter._reply_not_sent = {'effect': 'NOT_SENT', 'code': str(exc)}
+            self._local_telemetry('SDK_REPLY_NOT_SENT', self.adapter._reply_not_sent)
+            return {'ok': False, **self.adapter._reply_not_sent}
+
+    def _local_telemetry(self, kind, body):
+        # SDK reporting is not business delivery. Even local recording failure
+        # must not replace the original SDK exception or create an outbox fence.
+        try:
+            self.adapter.mailbox.observe(self.operation, self.attempt, kind,
+                                         self.adapter.guard.sanitize(body))
+        except Exception:
+            pass
+        return {'ok': False}
 
     async def send_event(self, content, message_type, metadata=None):
-        return await self._send("send_event", {"content": content, "message_type": message_type, "metadata": metadata})
+        return self._local_telemetry('SDK_TELEMETRY_SUPPRESSED',
+                                     {'content': content, 'message_type': message_type, 'metadata': metadata})
 
     async def send_failure(self, failure):
-        content, metadata = to_failure_event(failure)
-        return await self.send_event(content, "error", metadata)
+        try:
+            content, metadata = to_failure_event(failure)
+            return self._local_telemetry('SDK_FAILURE_LOCAL', {'content': content, 'metadata': metadata})
+        except Exception:
+            return {'ok': False}
 
     async def no_reply(self, reason=None):
         return {"status": "no_reply"}
@@ -182,17 +249,24 @@ class GuardedTools:
                 self.adapter.guard.require_clean(result)
                 self.adapter.mailbox.observe(self.operation, self.attempt, 'LOCAL_GIT_TOOL_RESULT', {'name': name, 'call_id': self.call_id, 'receipt': result})
             elif name == 'dh_verify':
-                effect, result = await self.adapter.verification.start(self.operation, self.attempt, self.call_id, arguments)
-                self.adapter._verification_effect = effect
+                try:
+                    effect, result = await self.adapter.verification.start(self.operation, self.attempt, self.call_id, arguments)
+                    self.adapter._verification_effect = effect
+                except BaseException:
+                    effect = digest(encode([self.operation, self.attempt, self.call_id, 'dh_verify']).encode())
+                    with self.adapter.mailbox.owner.transaction(self.adapter.mailbox.owner.epoch) as db:
+                        if db.execute('SELECT 1 FROM c_verification_effect WHERE id=? AND operation=? AND attempt=?', (effect, self.operation, self.attempt)).fetchone():
+                            self.adapter._verification_effect = effect
+                    raise
             elif name == 'dh_verification_read':
                 self.adapter.guard.require_clean(arguments)
                 if not isinstance(arguments, dict) or set(arguments) != {'effect_id', 'artifact', 'offset', 'limit'}:
                     raise IntegrationError('TYPED_VERIFICATION_ARGUMENTS_REQUIRED')
                 result = await asyncio.to_thread(self.adapter.verification.read_page, self.operation, self.attempt, **arguments)
             elif name == "band_send_message":
-                result = await self.send_message(**arguments)
+                result = await self._send('send_message', {'mentions': None, **arguments})
             elif name == "band_send_event":
-                result = await self.send_event(**arguments)
+                result = await self._send('send_event', {'metadata': None, **arguments})
             elif name == "band_no_reply":
                 result = await self.no_reply(**arguments)
             elif name in READ_TOOLS:

@@ -137,6 +137,11 @@ class OwnedStdioClient(CodexStdioClient):
                     os.killpg(self.group, signal.SIGKILL)
         await super().close()
         members = group_members(self.group) if self.group is not None else []
+        for _ in range(300):  # Bounded cessation observation, not a turn budget.
+            if not members:
+                break
+            await asyncio.sleep(.01)
+            members = group_members(self.group)
         self.record("PROCESS_STOPPED" if not members else "PROCESS_STOP_UNKNOWN", {"members": members})
         if members:
             raise IntegrationError("PROCESS_TERMINATION_UNKNOWN")
@@ -158,7 +163,7 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
             raise IntegrationError("UNSAFE_RUNTIME_CONFIGURATION")
         if not config.system_prompt or not config.model or not config.reasoning_effort or not config.workspace_for_room:
             raise IntegrationError("EXPLICIT_RUNTIME_CONFIG_REQUIRED")
-        super().__init__(config=config)
+        super().__init__(config=config, emit=())
         self.mailbox, self.router, self.guard = mailbox, router, guard
         self.git_broker = LocalGitBroker(mailbox, router, display_name, slug(display_name) + '@actors.invalid', workspace)
         self.verification = VerificationBridge(mailbox, router, guard, report_parsers=report_parsers, receipt_run_resolver=receipt_run_resolver)
@@ -182,6 +187,8 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
         self.stopping = False
         self.auto_recover_settled_timeouts = auto_recover_settled_timeouts
         self.recovery_idle_client_pids = lambda: set()
+        from .provider_recovery import register_policy
+        register_policy(self.mailbox, self.router)
 
     def recover_settled_timeout(self, operation, attempt):
         from .codex_timeout import CodexTimeoutRecovery
@@ -202,33 +209,40 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
 
     async def _drain(self):
         while not self.stopping:
+            if not self.router.active():
+                return
             work = self.mailbox.next_ready(self.alias)
             if work is None:
+                with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+                    due = db.execute("SELECT MIN(r.not_before) FROM c_retry_wait r JOIN c_work w ON w.id=r.operation WHERE w.seat=? AND w.state='QUEUED' AND w.delivery='READY'", (self.alias,)).fetchone()[0]
+                if due is not None and due > datetime.now(timezone.utc).timestamp():
+                    asyncio.get_running_loop().call_later(due - datetime.now(timezone.utc).timestamp() + 1, self._wake)
                 return
             attempt = str(uuid.uuid4())
             self.mailbox.claim(work["id"], attempt)
             token = self.current.set((work["id"], attempt))
-            self._active_room.set(self.allowed_room)
-            room_state = self._room_client(self.allowed_room)
-            # Never select a sender-unfiltered per-message SDK thread.
-            # Latest verified own thread is durable across native client retirement.
-            if room_state.client is not None and hasattr(room_state.client, 'evidence'):
-                room_state.client.evidence.bind((work['id'], attempt))
-            self._yielded = False
-            self._sdk_outcome = None
-            envelope = json.loads(work["input"])
-            msg = PlatformMessage(id=envelope.get("id", work["id"]), room_id=self.allowed_room,
-                  content=encode({'original_task': envelope['content'], 'peer_answers': envelope.get('peer_answers', []), 'recovery_receipt': envelope.get('recovery_receipt')}) if envelope.get('peer_answers') or envelope.get('recovery_receipt') else envelope['content'], sender_id=envelope.get("sender_id", self.coordinator_id),
-                  sender_type=envelope.get("sender_type", "agent"), sender_name=envelope.get("sender_name"),
-                  message_type="text", metadata=envelope.get("metadata", {}),
-                  created_at=datetime.fromisoformat(envelope.get("created_at", datetime.now(timezone.utc).isoformat())))
-            tools = GuardedTools(self.raw_tools, self, work["id"], attempt)
-            owned = self.thread_ownership.latest(work['thread'])
-            thread = owned['thread'] if owned else None
-            history = CodexSessionState(thread_id=thread, room_id=self.allowed_room)
-            self._verification_effect = None
-            self._cutover_history = None
             try:
+                self._active_room.set(self.allowed_room)
+                room_state = self._room_client(self.allowed_room)
+                # Never select a sender-unfiltered per-message SDK thread.
+                # Latest verified own thread is durable across native client retirement.
+                if room_state.client is not None and hasattr(room_state.client, 'evidence'):
+                    room_state.client.evidence.bind((work['id'], attempt))
+                self._yielded = False
+                self._sdk_outcome = None
+                self._reply_not_sent = None
+                envelope = json.loads(work["input"])
+                msg = PlatformMessage(id=envelope.get("id", work["id"]), room_id=self.allowed_room,
+                      content=encode({'original_task': envelope['content'], 'peer_answers': envelope.get('peer_answers', []), 'recovery_receipt': envelope.get('recovery_receipt')}) if envelope.get('peer_answers') or envelope.get('recovery_receipt') else envelope['content'], sender_id=envelope.get("sender_id", self.coordinator_id),
+                      sender_type=envelope.get("sender_type", "agent"), sender_name=envelope.get("sender_name"),
+                      message_type="text", metadata=envelope.get("metadata", {}),
+                      created_at=datetime.fromisoformat(envelope.get("created_at", datetime.now(timezone.utc).isoformat())))
+                tools = GuardedTools(self.raw_tools, self, work["id"], attempt)
+                owned = self.thread_ownership.latest(work['thread'])
+                thread = owned['thread'] if owned else None
+                history = CodexSessionState(thread_id=thread, room_id=self.allowed_room)
+                self._verification_effect = None
+                self._cutover_history = None
                 # Call actual SDK turn runner. Slash commands deliberately disabled:
                 # seat messages cannot change sandbox/model/grants or resolve asks.
                 await super()._run_turn(msg=msg, tools=tools, history=history,
@@ -240,13 +254,16 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
                 outcome = self._sdk_outcome or "failed"
                 # Runtime turn completed is NOT parent WorkItem acceptance.
                 state = {"completed": "SUCCEEDED", "interrupted": "CANCELLED"}.get(outcome, "FAILED")
-                self.mailbox.update(work["id"], attempt, state=state, delivery="RETURNED", result={"runtime_status": outcome, "git": evidence, "acceptance": "NOT_EVALUATED"})
+                self.mailbox.update(work["id"], attempt, state=state, delivery="RETURNED", result={"runtime_status": outcome, "git": evidence, "acceptance": "NOT_EVALUATED", **({'reply': self._reply_not_sent} if self._reply_not_sent else {})})
             except VerificationYield as yielded:
                 # Model turn is gone; the work remains RUNNING/STARTED while
                 # the owned trusted checker runs outside SDK's turn timeout.
-                await self._retire_owned_client()
-                self._record('VERIFICATION_WAIT', {'effect': yielded.effect_id, 'sdk_turn_timeout_seconds': self.config.turn_timeout_s, 'checker_wait': 'OWNED_ASYNC_NO_DEFAULT_BUDGET'})
                 try:
+                    try:
+                        await self._retire_owned_client()
+                    except BaseException as cleanup:
+                        self._record('PROCESS_STOP_UNKNOWN', {'code': type(cleanup).__name__})
+                    self._record('VERIFICATION_WAIT', {'effect': yielded.effect_id, 'sdk_turn_timeout_seconds': self.config.turn_timeout_s, 'checker_wait': 'OWNED_ASYNC_NO_DEFAULT_BUDGET'})
                     await self.verification.broker.wait(work['id'], attempt, yielded.effect_id)
                     child = self.verification.complete(work['id'], attempt, yielded.effect_id)
                     if child is None:
@@ -264,9 +281,25 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
                 self.mailbox.update(work["id"], attempt, state="PAUSED", delivery="DELIVERY_UNKNOWN")
                 raise
             except BaseException as exc:
+                self._record("RUNTIME_ERROR", {"code": type(exc).__name__, "diagnostic": self.guard.redact(str(exc)), "replay": "FENCED"})
+                try:
+                    await self._retire_owned_client()
+                    state = self._active_client_state()
+                    if not state or state.client is None:
+                        self._record('ATTEMPT_PROCESS_CLEAN', {'proof': 'NO_OWNED_CLIENT_REMAINS'})
+                    released = self.mailbox.release_unstarted(work['id'], attempt, type(exc).__name__)
+                    if released:
+                        if released['terminal']:
+                            self._notify_blocker(work['id'], attempt)
+                            # This work is settled, not a seat-wide fence. Drain
+                            # the next independent task without another message.
+                            continue
+                        asyncio.get_running_loop().call_later(released['backoff_s'], self._wake)
+                        return
+                except BaseException as cleanup:
+                    self._record('PROCESS_STOP_UNKNOWN', {'code': type(cleanup).__name__})
                 # Failure return may leave native effects: fence, don't auto replay.
                 self.mailbox.update(work["id"], attempt, state="PAUSED", delivery="DELIVERY_UNKNOWN", result={"code": type(exc).__name__})
-                self._record("RUNTIME_ERROR", {"code": type(exc).__name__, "diagnostic": self.guard.redact(str(exc)), "replay": "FENCED"})
                 if isinstance(exc, TurnResultAlreadyReported):
                     try:
                         # The SDK exception is only a candidate. Retire the owned
@@ -279,13 +312,37 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
                             continue
                     except IntegrationError as blocked:
                         self._record('TIMEOUT_RECOVERY_BLOCKED', {'code': str(blocked)})
+                        try:
+                            from .provider_recovery import CodexProviderRecovery
+                            provider = CodexProviderRecovery(self.mailbox, self.router, self.git_broker, self.recovery_idle_client_pids)
+                            recovered = provider.recover(work['id'], attempt)
+                            self._record('PROVIDER_RECOVERY_RESULT', recovered)
+                            if recovered.get('id'):
+                                asyncio.get_running_loop().call_later(recovered['backoff_s'] + 1, self._wake)
+                                return
+                            if recovered.get('terminal'):
+                                self._notify_blocker(work['id'], attempt)
+                                continue
+                        except IntegrationError as provider_blocked:
+                            self._record('PROVIDER_RECOVERY_BLOCKED', {'code': str(provider_blocked)})
                 return
             finally:
                 try:
                     await self._retire_owned_client()
                 except BaseException as exc:
                     self._record('PROCESS_STOP_UNKNOWN', {'code': type(exc).__name__})
+                settled = self.mailbox.read_work(work['id'])
+                if settled['state'] == 'FAILED' or settled['delivery'] == 'DELIVERY_UNKNOWN':
+                    self._notify_blocker(work['id'], attempt)
                 self.current.reset(token)
+
+    def _notify_blocker(self, operation, attempt):
+        with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='c_recovery'").fetchone() and db.execute("SELECT 1 FROM c_recovery r JOIN c_work w ON w.id=r.continuation WHERE r.operation=? AND r.attempt=? AND w.delivery IN ('READY','DISPATCHING','STARTED','RETURNED','YIELDED','RECONCILED')", (operation, attempt)).fetchone():
+                return
+        notify = getattr(self, 'coordinator_notify', None)
+        if notify:
+            notify(operation, attempt)
 
     async def _retire_owned_client(self):
         # Readiness may pre-create a client. Once bound, its raw stream is never
@@ -348,6 +405,7 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
     async def _start_turn(self, params):
         if not self.router.active():
             raise IntegrationError("GRANT_INACTIVE")
+        self._record('TURN_START_INTENT', {'thread': params.get('threadId')})
         result = await super()._start_turn(params)
         turn = result.get("turn", {})
         if not turn.get("id"):
@@ -414,7 +472,7 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
                 raise IntegrationError("QUESTION_CALLBACK_ID_MISSING")
             operation, attempt = self.current.get()
             qid = digest(encode([operation, attempt, str(event.id)]).encode())
-            context = {"task": msg.content, "questions": params, "session": self._turn_identity}
+            context = self.guard.sanitize({"task": msg.content, "questions": params, "session": self._turn_identity})
             self.guard.require_clean(context)
             self.mailbox.question(qid, operation, self.coordinator_id, context)
             if event.method == "item/tool/requestUserInput":
@@ -434,20 +492,36 @@ class DurableCodexAdapter(DurableSeatMixin, CodexAdapter):
             self._room_threads.pop(room_id, None)
             self.mailbox.update(operation, attempt, state="PAUSED", delivery="YIELDED")
             self._yielded = True
-            await tools.send_message(f"@[[{self.coordinator_id}]] PeerQuestion {qid}\n{encode(context)}\nReply to this seat with /dh-answer {qid} followed by a newline and the complete answer.", mentions=[self.coordinator_id])
+            reply = await tools.send_message(f"@[[{self.coordinator_id}]] PeerQuestion {qid}\n{encode(context)}\nReply to this seat with /dh-answer {qid} followed by a newline and the complete answer.", mentions=[self.coordinator_id])
+            if isinstance(reply, dict) and reply.get('effect') == 'NOT_SENT':
+                # The question never reached a peer. Do not orphan this work in
+                # YIELDED waiting for an answer that cannot arrive. This does not
+                # retry the native callback or any crossed-boundary send.
+                self.mailbox.update(operation, attempt, state='FAILED', delivery='RETURNED', result={'code': 'PEER_QUESTION_NOT_SENT', 'question': qid, 'reply': self._reply_not_sent, 'replay': 'FENCED'})
+                self._record('PEER_QUESTION_NOT_SENT', {'question': qid, 'reply': self._reply_not_sent})
             raise PeerYield()
         if isinstance(tools, GuardedTools):
             tools.call_id = str(params.get("callId") or event.id)
         self._verification_effect = None
-        settled = await super()._handle_server_request(tools=tools, msg=msg, room_id=room_id, event=event)
+        try:
+            settled = await super()._handle_server_request(tools=tools, msg=msg, room_id=room_id, event=event)
+        except Exception as exc:
+            if self._verification_effect is None:
+                raise
+            self._record('VERIFICATION_CALLBACK_REPLY_UNKNOWN', {'effect': self._verification_effect, 'code': type(exc).__name__})
+            settled = False
         if self._verification_effect is not None:
             # SDK has authenticated/responded to the native tool callback once.
             # Retire the model turn without awaiting checker runtime in SDK180s.
             effect = self._verification_effect
-            if self._turn_identity:
-                await self._client.request('turn/interrupt', {'threadId': self._turn_identity[0], 'turnId': self._turn_identity[1]}, retry_on_overload=False)
-            self._record('VERIFICATION_YIELD', {'effect': effect})
-            raise VerificationYield(effect)
+            try:
+                if self._turn_identity:
+                    await self._client.request('turn/interrupt', {'threadId': self._turn_identity[0], 'turnId': self._turn_identity[1]}, retry_on_overload=False)
+            except Exception as exc:
+                self._record('VERIFICATION_INTERRUPT_UNKNOWN', {'effect': effect, 'code': type(exc).__name__})
+            finally:
+                self._record('VERIFICATION_YIELD', {'effect': effect})
+                raise VerificationYield(effect)
         return settled
 
     async def cancel_owned(self, operation, attempt):

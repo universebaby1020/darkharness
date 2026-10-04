@@ -331,11 +331,26 @@ class SeatManager:
                     mailbox=self.mailbox, router=router, guard=guard, coordinator=coordinator)
                 adapter.startup_binding_pending = True
                 adapter.recovery_idle_client_pids = self.idle_client_pids
+                def notify(operation, attempt):
+                    coordinator_seat = next(s['alias'] for s in config['seats'] if s['role'] == 'coordinator')
+                    child = self.mailbox.notify_peer_blocker(operation, attempt, coordinator_seat, config['room_id'], config['run_id'])
+                    if child:
+                        for target in self.adapters:
+                            if target.alias == coordinator_seat:
+                                target._wake()
+                adapter.coordinator_notify = notify
                 agent = Agent.create(**{"adapter": adapter, "agent_id": ident, "api_key": credential})
                 self.adapters.append(adapter)
                 self.runtimes.append(runtime)
                 self.agents.append(agent)
                 bindings.append(asdict(binding))
+                # Mailbox restart can settle a proven unstarted third failure
+                # before adapters exist. Deliver its internal blocker now.
+                if hasattr(adapter, '_notify_blocker'):
+                    with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+                        blocked = db.execute("SELECT id,attempt FROM c_work WHERE seat=? AND (state='FAILED' OR delivery='DELIVERY_UNKNOWN')", (adapter.alias,)).fetchall()
+                    for work in blocked:
+                        adapter._notify_blocker(work['id'], work['attempt'])
             # Historical timeout proof is evaluated before readiness can create
             # new native processes. No SQLite edits or synthetic Band dispatch.
             self.recover_timeouts_on_startup()
@@ -452,7 +467,7 @@ def _deny_room():
 
 def _native_environment(settings, actor):
     env = dict(settings.runtime_env)
-    env.update({"GIT_AUTHOR_NAME": actor, "GIT_COMMITTER_NAME": actor,
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_AUTHOR_NAME": actor, "GIT_COMMITTER_NAME": actor,
                 "GIT_AUTHOR_EMAIL": slug(actor) + "@actors.invalid",
                 "GIT_COMMITTER_EMAIL": slug(actor) + "@actors.invalid"})
     return env
@@ -472,7 +487,7 @@ def codex_sdk_config(settings, room, text, actor):
         system_prompt=text, include_base_instructions=False, enable_self_config_tools=False,
         codex_command=settings.command, codex_env=_native_environment(settings, actor),
         turn_timeout_s=settings.turn_timeout_s, inject_history_on_resume_failure=False,
-        emit_turn_lifecycle_events=True, emit_diff_events=True, emit_token_usage_events=True)
+        emit_turn_lifecycle_events=False, emit_diff_events=False, emit_token_usage_events=False)
 
 
 def _codex_preflight(settings):

@@ -42,7 +42,7 @@ class VerificationTests(unittest.TestCase):
             self.git(p, 'init', '-q', '-b', 'main')
         (self.repo / 'base').write_text('base')
         self.commit(self.repo)
-        (self.source / 'check.py').write_text('import os,sys,time,json\nfrom pathlib import Path\ncheckout,out,mode=sys.argv[1:]\nout=Path(out)\nout.mkdir(mode=0o700,exist_ok=True)\nprint(checkout,flush=True)\nprint("stderr captured",file=sys.stderr,flush=True)\nassert "UNRELATED_FIXTURE" not in os.environ\nif mode=="sleep": time.sleep(20)\nif mode=="large": print("x"*200000)\n(out/"report.json").write_text(json.dumps({"accepted":mode!="reject"}))\nsys.exit(7 if mode=="fail" else 0)\n')
+        (self.source / 'check.py').write_text('import os,sys,time,json\nfrom pathlib import Path\ncheckout,out,mode=sys.argv[1:]\nout=Path(out)\nout.mkdir(mode=0o700,exist_ok=True)\nprint(checkout,flush=True)\nprint("stderr captured",file=sys.stderr,flush=True)\nassert "UNRELATED_FIXTURE" not in os.environ\nif mode=="sleep": time.sleep(20)\nif mode=="shortsleep": time.sleep(.3)\nif mode=="large": print("x"*200000)\n(out/"report.json").write_text(json.dumps({"accepted":mode!="reject"}))\nsys.exit(7 if mode=="fail" else 0)\n')
         self.commit(self.source)
         self.owner = LockedOwner()
         self.box = Mailbox(self.owner)
@@ -379,10 +379,10 @@ class VerificationTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
             pid = int((output / 'child.pid').read_text())
-            if mode == 'childsleep':
-                self.broker.cancel(self.op, 'a', mode)
+            # A naturally exited leader does not authorize killing descendants.
+            self.broker.cancel(self.op, 'a', mode)
             result = self.wait(mode)
-            self.assertEqual(result['state'], 'CANCELLED' if mode == 'childsleep' else 'SUCCEEDED')
+            self.assertEqual(result['state'], 'CANCELLED')
             st = Path(f'/proc/{pid}/stat')
             deadline = time.monotonic() + 3
             while st.exists() and st.read_text().rsplit(')', 1)[1].split()[0] != 'Z':
@@ -418,7 +418,7 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(self.wait('await')['state'], 'CANCELLED')
 
     def test_optional_timeout_with_source_not_inferred_policy(self):
-        self.mode('sleep')
+        self.mode('shortsleep')
         self.cfg.update(timeout_seconds=.15, limit_source='controller fixture limit')
         self.publish()
         self.start()

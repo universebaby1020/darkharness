@@ -176,10 +176,12 @@ class BridgeTests(unittest.TestCase):
         self.bridge.broker.parsers['json-v1'] = lambda p, code: (p/'absent.json').read_text()
         effect, result = self.run_check()
         self.assertEqual(result['state'], 'UNKNOWN')
-        self.assertIsNone(self.bridge.complete(f.op, 'a', effect))
+        child = self.bridge.complete(f.op, 'a', effect)
+        self.assertIn('FENCED', f.box.read_work(child)['input'])
+        f.box.claim(child, 'child')
         with self.assertRaisesRegex(IntegrationError, 'UNKNOWN_FENCE'):
-            self.bridge.broker.start(f.op, 'a', 'different-effect', check_id='check', checkout_receipt=f.snap, revision=f.revision)
-        self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_verification_continuation').fetchone()[0], 0)
+            self.bridge.broker.start(child, 'child', 'different-effect', check_id='check', checkout_receipt=f.snap, revision=f.revision)
+        self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_verification_continuation').fetchone()[0], 1)
 
     def test_late_stale_stop_and_revoke_evidence_only(self):
         f = self.fixture

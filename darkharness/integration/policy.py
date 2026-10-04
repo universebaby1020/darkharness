@@ -24,14 +24,44 @@ class ApprovalRouter:
         self.workspace = str(Path(workspace).resolve())
         self.configured_result_repo = result_repo
         self.result_repo = str(result_repo_boundary(self.workspace, result_repo))
+        self._repo_pin = self._identity_pin()
+
+    def _identity_pin(self):
+        import stat
+        pins = []
+        for path in (Path(self.result_repo), Path(self.result_repo) / '.git'):
+            try:
+                st = path.lstat()
+            except FileNotFoundError:
+                # Legacy non-Git workspace routing remains supported. Pin absence
+                # too: it cannot silently become a different repository authority.
+                pins.append(None)
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                raise IntegrationError('DIRECT_REPO_DIRECTORY_REQUIRED')
+            pins.append((st.st_dev, st.st_ino))
+        return tuple(pins)
+
+    def _reason(self, db, reason):
+        from .mailbox import Mailbox, encode
+        key = encode([self.grant_id, self.run_id, self.seat, self.room, self.workspace, self.result_repo])
+        # Scope checks also run in controller preparation before Mailbox exists.
+        # Use the same owner event schema; do not lose or suppress transitions.
+        db.execute('CREATE TABLE IF NOT EXISTS c_event(seq INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT, kind TEXT, body TEXT, at TEXT)')
+        db.execute('CREATE TABLE IF NOT EXISTS c_grant_observation(binding TEXT PRIMARY KEY, reason TEXT)')
+        old = db.execute('SELECT reason FROM c_grant_observation WHERE binding=?', (key,)).fetchone()
+        if not old or old[0] != reason:
+            Mailbox.event(db, None, 'GRANT_SCOPE_CHANGED', {'grant_id': self.grant_id, 'run_id': self.run_id, 'seat': self.seat, 'reason': reason})
+            db.execute('INSERT OR REPLACE INTO c_grant_observation VALUES(?,?)', (key, reason))
+        return None
 
     def _scope(self, db):
         row = db.execute("SELECT body FROM controls WHERE kind='grant' AND id=?", (self.grant_id,)).fetchone()
         if not row:
-            return None
+            return self._reason(db, 'GRANT_MISSING')
         grant = json.loads(row[0])
         if grant.get("revoked") or not grant.get("source") or not grant.get("end_condition"):
-            return None
+            return self._reason(db, 'GRANT_REVOKED_OR_INVALID')
         scope = grant.get("scope", {})
         # Run completion/revoke is an explicit end condition, not an invented
         # numeric time or retry budget. Validate an expiry only when supplied.
@@ -39,24 +69,24 @@ class ApprovalRouter:
             try:
                 expiry = datetime.fromisoformat(scope["expires_at"].replace("Z", "+00:00"))
                 if expiry <= datetime.now(timezone.utc):
-                    return None
+                    return self._reason(db, 'GRANT_EXPIRED')
             except (TypeError, ValueError):
-                return None
+                return self._reason(db, 'GRANT_EXPIRY_INVALID')
         run = db.execute("SELECT body FROM controls WHERE kind='run' AND id=?", (self.run_id,)).fetchone()
         if run and json.loads(run[0]).get("state") in {"STOPPED", "COMPLETED", "REVOKED"}:
-            return None
+            return self._reason(db, 'RUN_ENDED')
         if scope.get("run_id") != self.run_id or self.seat not in scope.get("seats", []) or self.room not in scope.get("rooms", []) or str(Path(scope.get("workspace", "")).resolve()) != self.workspace:
-            return None
+            return self._reason(db, 'SCOPE_BINDING_MISMATCH')
         # Repository narrowing is authenticated alongside the workspace ceiling.
         # A runtime config cannot choose a different repo using the same Grant.
         if scope.get('result_repo') != self.configured_result_repo:
-            return None
-        from .git_broker import result_repo_boundary
+            return self._reason(db, 'REPO_BINDING_MISMATCH')
         try:
-            if str(result_repo_boundary(self.workspace, self.configured_result_repo)) != self.result_repo:
-                return None
+            if self._identity_pin() != self._repo_pin:
+                return self._reason(db, 'REPO_IDENTITY_CHANGED')
         except (IntegrationError, OSError, ValueError):
-            return None
+            return self._reason(db, 'REPO_IDENTITY_CHANGED')
+        self._reason(db, 'ACTIVE')
         return scope
 
     def active(self):

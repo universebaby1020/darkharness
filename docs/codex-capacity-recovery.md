@@ -2,8 +2,12 @@
 
 `integration.capacity.recover`는 원래 모델이 native `serverOverloaded`로 실패했고
 해당 attempt에 native 도구·업무 효과가 관측되지 않은 경우만 다룬다. ACK된 SDK
-상태 보고는 실제 외부 효과로 별도 검증·보존한다. 자동 재시도,
-모델 변경, provider 변경, timeout 권한 확대는 제공하지 않는다. 작업 acceptance는
+상태 보고는 실제 외부 효과로 별도 검증·보존한다. 이 명시적 action 자체는
+자동 재시도, 모델 변경, provider 변경, timeout 권한 확대를 제공하지 않는다.
+WO08에서 승인한 별도 run-scoped `settled_provider_recovery`만 사전 등록된
+정책과 인증된 dispatch receipt 아래에서 자동 재시도한다(`wo08-recovery.md`).
+현재 SDK 자동 텔레메트리는 로컬 best effort로 억제하며, 보고가 없어도 native
+terminal/프로세스/전체 RPC/효과 원장과 token delta 검증은 유지한다. 작업 acceptance는
 회복 후에도 `NOT_EVALUATED`다.
 
 Controller gateway 요청은 기존 envelope의 `operation_id`에 정확한 실패 작업을,

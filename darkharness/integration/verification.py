@@ -361,8 +361,7 @@ class VerificationBroker:
         request, receipt = json.loads(snap['request']), json.loads(snap['receipt'])
         if request.get('kind') != 'snapshot' or receipt.get('state') != 'SNAPSHOT' or receipt.get('independent') is not True or request.get('revision') != revision or receipt.get('revision') != revision or request.get('path') != receipt.get('path'):
             raise IntegrationError('CHECKOUT_RECEIPT_MISMATCH')
-        from .git_broker import result_repo_boundary
-        source = _path(str(result_repo_boundary(self.router.workspace, getattr(self.router, 'configured_result_repo', None))))
+        source = _path(self.router.result_repo)
         identity = _identity(source)
         ref = _git(source, 'symbolic-ref', '-q', 'HEAD').decode().strip()
         if identity != request.get('identity') or binding is not None and binding.get('source_ref') != ref:
@@ -527,8 +526,14 @@ class VerificationBroker:
                 # started thread for close, and never erase the durable intent.
                 job.cancel.set()
                 if job.thread.ident is None:
-                    job.thread = None  # No joinable thread; intent stays fenced.
+                    job.thread = None
+                    result = {'state': 'FAILED', 'accepted': False, 'reason': 'THREAD_NOT_EXECUTED', 'external_execution': 'NOT_EXECUTED', 'artifacts': {}, 'exit_code': None, 'revision': revision, 'run_id': self.router.run_id}
+                    with self.owner.transaction(self.owner.epoch) as db:
+                        ref = Mailbox.artifact(db, encode(result).encode())
+                        db.execute("UPDATE c_verification_effect SET state='FAILED',result=? WHERE id=? AND owner=?", (encode(result), effect_id, self.token))
+                        Mailbox.event(db, operation, 'VERIFICATION_RESULT', {'attempt': attempt, 'id': effect_id, 'result_ref': ref, 'state': 'FAILED'})
                     job.done.set()
+                    return {'id': effect_id, 'state': 'FAILED', 'result': result}
                 raise IntegrationError('VERIFICATION_START_UNKNOWN') from None
             return {'id': effect_id, 'state': 'INTENT', 'result': None}
 
@@ -542,6 +547,13 @@ class VerificationBroker:
         except IntegrationError:
             return False
 
+    def _explicit_stop(self, db, operation, attempt):
+        grant = db.execute("SELECT body FROM controls WHERE kind='grant' AND id=?", (self.router.grant_id,)).fetchone()
+        run = db.execute("SELECT body FROM controls WHERE kind='run' AND id=?", (self.router.run_id,)).fetchone()
+        return bool((grant and json.loads(grant[0]).get('revoked')) or
+                    (run and json.loads(run[0]).get('state') in {'STOPPED', 'COMPLETED', 'REVOKED'}) or
+                    db.execute("SELECT 1 FROM c_control WHERE operation=? AND attempt=? AND kind='cancel'", (operation, attempt)).fetchone())
+
     @staticmethod
     def _kill(job):
         # Child remains ours while unreaped. Never signal persisted/stale PID.
@@ -551,6 +563,39 @@ class VerificationBroker:
                 os.killpg(p.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    def _monitor(self, job, operation, attempt, identifier, request, cfg, binding, private, began, state, reason):
+        # Keep the unreaped leader as our group identity pin. Natural termination
+        # and explicit cancellation are the only paths out; observations and
+        # configured limits do not grant authority to signal the checker.
+        from .codex import group_members
+        while True:
+            stop = False
+            try:
+                with self.owner.transaction(self.owner.epoch) as db:
+                    stop = self._explicit_stop(db, operation, attempt)
+                    live = self._live(db, operation, attempt, request, cfg, binding)
+                    if not live and not stop and not getattr(job, 'authority_uncertain', False):
+                        Mailbox.event(db, operation, 'VERIFICATION_AUTHORITY_UNCERTAIN', {'attempt': attempt, 'id': identifier})
+                    job.authority_uncertain = not live
+            except Exception:
+                # Unreadable authority is an uncertain observation, not revoke.
+                job.authority_uncertain = True
+            if job.cancel.is_set() or stop:
+                state, reason = 'CANCELLED', 'STOP_REVOKE_OR_CANCEL'
+                self._kill(job)
+            elif cfg.get('timeout_seconds') is not None and time.monotonic() - began >= cfg['timeout_seconds']:
+                state, reason = 'TIMED_OUT', 'EXPLICIT_CONTROLLER_TIMEOUT'
+            elif cfg.get('max_log_bytes') is not None:
+                try:
+                    if sum((private / n).stat().st_size for n in ('stdout', 'stderr')) > cfg['max_log_bytes']:
+                        state, reason = 'FAILED', 'EXPLICIT_CONTROLLER_LOG_LIMIT'
+                except OSError:
+                    pass
+            exited = os.waitid(os.P_PID, job.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if exited is not None and not group_members(job.process.pid):
+                return state, reason, job.process.wait()
+            job.cancel.wait(.05)
 
     def _run(self, job, operation, attempt, identifier, request, cfg, binding, provenance, executable_identity, checkout, output):
         state, reason, code = 'UNKNOWN', 'PROCESS_OR_RESULT_UNCERTAIN', None
@@ -579,8 +624,10 @@ class VerificationBroker:
                 os.chmod(private / 'stdout', 0o600)
                 os.chmod(private / 'stderr', 0o600)
                 with self.owner.transaction(self.owner.epoch) as db:
-                    if job.cancel.is_set() or not self._live(db, operation, attempt, request, cfg, binding):
+                    if job.cancel.is_set() or self._explicit_stop(db, operation, attempt):
                         state, reason = 'CANCELLED', 'STOP_REVOKE_OR_CANCEL'
+                    elif not self._live(db, operation, attempt, request, cfg, binding):
+                        state, reason = 'FAILED', 'AUTHORITY_UNAVAILABLE_NOT_EXECUTED'
                     else:
                         # Revalidate exact receipt and source immediately before effect.
                         self._receipt(db, operation, attempt, request['checkout_receipt'], request['revision'], provenance, cfg)
@@ -591,26 +638,7 @@ class VerificationBroker:
                         Mailbox.event(db, operation, 'VERIFICATION_SPAWN', {'id': identifier, 'process': proc, 'argv': argv, 'cwd': str(cwd), 'source_head': cfg['source_head'], 'source_tree': cfg['source_tree'], 'executable': executable_identity})
                 began = time.monotonic()
                 if job.process is not None:
-                    while True:
-                        with self.owner.transaction(self.owner.epoch) as db:
-                            live = self._live(db, operation, attempt, request, cfg, binding)
-                        if job.cancel.is_set() or not live:
-                            state, reason = 'CANCELLED', 'STOP_REVOKE_OR_CANCEL'
-                            self._kill(job)
-                        elif cfg.get('timeout_seconds') is not None and time.monotonic() - began >= cfg['timeout_seconds']:
-                            state, reason = 'TIMED_OUT', 'EXPLICIT_CONTROLLER_TIMEOUT'
-                            self._kill(job)
-                        elif cfg.get('max_log_bytes') is not None and sum((private / n).stat().st_size for n in ('stdout', 'stderr')) > cfg['max_log_bytes']:
-                            state, reason = 'FAILED', 'EXPLICIT_CONTROLLER_LOG_LIMIT'
-                            self._kill(job)
-                        # Observe without reaping: the leader PID still pins our
-                        # group identity while cleaning up checker descendants.
-                        exited = os.waitid(os.P_PID, job.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                        if exited is not None:
-                            self._kill(job)
-                            code = job.process.wait(timeout=3)
-                            break
-                        job.cancel.wait(.05)
+                    state, reason, code = self._monitor(job, operation, attempt, identifier, request, cfg, binding, private, began, state, reason)
                     if state not in {'CANCELLED', 'TIMED_OUT', 'FAILED'}:
                         state, reason = ('FAILED', 'CHECKER_NONZERO') if code else ('UNKNOWN', 'REPORT_UNVERIFIED')
             for name in ('stdout', 'stderr'):
@@ -629,13 +657,14 @@ class VerificationBroker:
                     state, reason = ('SUCCEEDED', 'DECLARED_REPORT_ACCEPTED') if accepted else ('FAILED', 'DECLARED_REPORT_REJECTED')
         except BaseException:
             # Exceptions and checker stdout can contain credentials. Safe reason only.
-            self._kill(job)
-            if job.process is not None:
-                try:
-                    code = job.process.wait(timeout=3)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-            if state not in {'CANCELLED', 'TIMED_OUT'}:
+            if job.process is not None and job.process.returncode is None:
+                # Observation/ledger/report exceptions never authorize a kill.
+                state, reason, code = self._monitor(job, operation, attempt, identifier, request, cfg, binding, private, time.monotonic(), 'UNKNOWN', 'PROCESS_OR_REPORT_UNCERTAIN')
+            elif job.process is not None:
+                code = job.process.returncode
+            if job.process is None:
+                state, reason = 'FAILED', 'PROCESS_NOT_EXECUTED'
+            elif state not in {'CANCELLED', 'TIMED_OUT'}:
                 if code is not None and code != 0 and not any(cfg['effects'].values()):
                     state, reason = 'FAILED', 'CHECKER_NONZERO_REPORT_UNVERIFIED'
                 else:
@@ -649,6 +678,8 @@ class VerificationBroker:
             result = {'state': state, 'reason': reason, 'accepted': state == 'SUCCEEDED', 'exit_code': code, 'output': str(output), 'output_layout': cfg.get('output_layout', 'checker-owned-v1'), 'artifacts': artifacts, 'report_contract': cfg['report_contract'], 'limit_source': cfg.get('limit_source'), 'effects': cfg['effects'], 'revision': request['revision'], 'checkout_receipt': request['checkout_receipt'], 'source_commit_effect': provenance['commit_effect'], 'run_id': self.router.run_id}
             # Preserve process failure separately from uncertain declared external
             # effects. Only the trusted pinned recognizer proves preexecution.
+            if job.process is None:
+                result.update(external_execution='NOT_EXECUTED', replay='NOT_EXECUTED')
             result['process_state'] = 'FAILED' if code is not None and code != 0 else 'EXITED' if code == 0 else 'UNKNOWN'
             if (code == 2 and state not in {'CANCELLED', 'TIMED_OUT'} and
                     cfg.get('source_head') == '803560d2a678ace1414465c098eb0ab5380ffade' and

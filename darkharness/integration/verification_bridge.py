@@ -25,12 +25,11 @@ class VerificationBridge:
         self.broker = VerificationBroker(mailbox, router, report_parsers=parsers,
                                          receipt_run_resolver=receipt_run_resolver)
         with mailbox.owner.transaction(mailbox.owner.epoch) as db:
+            self._schema_checks = sorted((router._scope(db) or {}).get('verification', {}).get('checks', {}))
             db.execute('CREATE TABLE IF NOT EXISTS c_verification_continuation(effect TEXT PRIMARY KEY, result_ref TEXT NOT NULL, child TEXT NOT NULL)')
 
     def schemas(self):
-        with self.box.owner.transaction(self.box.owner.epoch) as db:
-            scope = self.router._scope(db)
-            checks = (scope or {}).get('verification', {}).get('checks', {})
+        checks = self._schema_checks
         if not checks:
             return []
         return [
@@ -65,7 +64,7 @@ class VerificationBridge:
         return row, result, ref
 
     def complete(self, operation, attempt, effect):
-        """One atomic continuation only for actual known success/failure, never STOP."""
+        """One atomic completion continuation; uncertain results are evidence only."""
         with self.box.owner.transaction(self.box.owner.epoch) as db:
             row, result, ref = self._result(db, effect)
             if row['operation'] != operation or row['attempt'] != attempt:
@@ -77,12 +76,11 @@ class VerificationBridge:
                 return old['child']
             parent = db.execute('SELECT * FROM c_work WHERE id=?', (operation,)).fetchone()
             scope = self.router._scope(db)
-            run = db.execute("SELECT body FROM controls WHERE kind='run' AND id=?", (self.router.run_id,)).fetchone()
-            uncertain = run and json.loads(run[0]).get('state') in {'UNKNOWN', 'DELIVERY_UNKNOWN', 'EFFECT_UNKNOWN', 'CLOSED_UNRESOLVED'}
+            stop_unknown = any(json.loads(r[0]).get('attempt') == attempt for r in db.execute("SELECT body FROM c_event WHERE operation=? AND kind='PROCESS_STOP_UNKNOWN'", (operation,)))
             request, configuration = json.loads(row['request']), json.loads(row['config'])
-            still_authorized = self.broker._live(db, operation, attempt, request, configuration['check'], configuration['restriction'])
+            known_stale = result['state'] in {'SUCCEEDED', 'FAILED'} and result.get('external_execution') != 'NOT_EXECUTED' and not self.broker._live(db, operation, attempt, request, configuration['check'], configuration['restriction'])
             pending_stop = db.execute("SELECT 1 FROM c_control WHERE operation=? AND attempt=? AND kind='cancel'", (operation, attempt)).fetchone()
-            if not scope or not still_authorized or uncertain or pending_stop or not parent or parent['attempt'] != attempt or parent['seat'] != self.router.seat or parent['room'] != self.router.room or parent['state'] != 'RUNNING' or parent['delivery'] not in {'STARTED', 'DISPATCHING'} or result['state'] not in {'SUCCEEDED', 'FAILED'}:
+            if stop_unknown or not scope or known_stale or result.get('reason') == 'STOP_REVOKE_OR_CANCEL' or self.broker._explicit_stop(db, operation, attempt) or pending_stop or not parent or parent['attempt'] != attempt or parent['seat'] != self.router.seat or parent['room'] != self.router.room or parent['state'] != 'RUNNING' or parent['delivery'] not in {'STARTED', 'DISPATCHING'} or result['state'] not in {'SUCCEEDED', 'FAILED', 'UNKNOWN', 'TIMED_OUT', 'CANCELLED'}:
                 Mailbox.event(db, operation, 'VERIFICATION_COMPLETION_EVIDENCE_ONLY', {'attempt': attempt, 'effect': effect, 'result_ref': ref})
                 return None
             return self._queue(db, parent, result, ref, effect, attempt)
@@ -92,6 +90,8 @@ class VerificationBridge:
         public = {k: result.get(k) for k in ('state', 'accepted', 'exit_code', 'reason', 'revision')}
         if result.get('external_execution') == 'NOT_EXECUTED':
             public['external_execution'] = 'NOT_EXECUTED'
+        if result['state'] not in {'SUCCEEDED', 'FAILED'}:
+            public.update(replay='FENCED', instruction='EVIDENCE_ONLY_DO_NOT_REPEAT_CHECKER_EFFECT')
         public.update(id=effect, result_ref=ref, artifact_hashes={k: v['sha256'] for k, v in result['artifacts'].items()})
         self.guard.require_clean(public)
         body = json.loads(parent['input'])

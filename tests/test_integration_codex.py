@@ -230,9 +230,10 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         tools = GuardedTools(self.tools, self.adapter, op, "a")
         assembled = "sk" + "-" + "Z" * 20
         with self.assertRaisesRegex(IntegrationError, "OUTBOX_SECRET_BLOCKED"):
-            await tools.send_message(assembled, ["peer"])
-        with self.assertRaisesRegex(IntegrationError, "OUTBOX_SECRET_BLOCKED"):
-            await tools.send_event("result", "tool_result", {"output": assembled})
+            await tools._send('send_message', {'content': assembled, 'mentions': ['peer']})
+        self.assertEqual(await tools.send_event("result", "tool_result", {"output": assembled}), {'ok': False})
+        outcome = await tools.execute_tool_call_structured('band_send_event', {'content': 'result', 'message_type': 'tool_result', 'metadata': {'output': assembled}})
+        self.assertFalse(outcome.ok)
         outcome = await tools.execute_tool_call_structured("band_send_message", {"content": assembled, "mentions": ["peer"]})
         self.assertFalse(outcome.ok)
         self.assertFalse(self.tools.sent)
@@ -408,6 +409,10 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         head = git('rev-parse', 'HEAD')
         (self.root / 'smoke.txt').write_text('DarkHarness smoke ok\n')
         self.owner.grant(self.root, local_git_write={'directories': ['.']}, review_snapshot={'scratch': str(self.root / '.review')})
+        # Repository identity must exist before startup pinning.
+        self.router = ApprovalRouter(self.owner, 'g', 's', 'r', 'run', self.root)
+        self.adapter = self.make_adapter()
+        await self.adapter.on_started('dh builder', 'component')
         event = SimpleNamespace(kind='request', method='item/tool/call', id=51, params={'tool': 'dh_local_git_commit', 'arguments': {'cwd': str(self.root), 'paths': ['smoke.txt'], 'message': 'smoke', 'expected_head': head}, 'callId': 'git-call'})
         self.client.events = [event, event]
         await self.deliver(self.message())
@@ -419,8 +424,8 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('dh_local_git_commit', [s['name'] for s in schemas])
         self.assertIn('dh_review_snapshot', [s['name'] for s in schemas])
         reports = [content for content, typ, meta in self.tools.events if typ in {'tool_call', 'tool_result'}]
-        self.assertTrue(any('dh_local_git_commit' in content for content in reports))
-        self.assertTrue(any('COMMITTED' in content for content in reports))
+        self.assertEqual(reports, [])  # SDK telemetry disabled; native callback remains proved.
+        self.assertTrue(self.owner.db.execute("SELECT 1 FROM c_event WHERE kind='LOCAL_GIT_TOOL_RESULT'").fetchone())
         created_revision = git('rev-parse', 'HEAD')
         self.client.events = [SimpleNamespace(kind='request', method='item/tool/call', id=52, params={'tool': 'dh_review_snapshot', 'arguments': {'cwd': str(self.root), 'revision': created_revision, 'name': 'independent'}, 'callId': 'snapshot-call'})]
         await self.deliver(self.message('snapshot', 'review the exact peer revision'))

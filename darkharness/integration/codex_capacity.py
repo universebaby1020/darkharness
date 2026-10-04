@@ -36,11 +36,11 @@ def verify_sdk_pin():
         raise IntegrationError('CAPACITY_SDK_PIN_MISMATCH')
 
 
-def terminal_evidence(db, parent, router):
+def terminal_evidence(db, parent, router, *, provider=False):
     """Read-only native proof; recover persists its canonical references later."""
     verify_sdk_pin()
     try:
-        return _terminal_evidence(db, parent, router)
+        return _terminal_evidence(db, parent, router, provider=provider)
     except (KeyError, TypeError, ValueError, AttributeError):
         raise IntegrationError('CAPACITY_CANONICAL_EVIDENCE_MALFORMED') from None
 
@@ -143,7 +143,7 @@ def _sdk_reports(db, parent, router, rows, events, start, accepted, completed, o
     return reports, refs
 
 
-def _terminal_evidence(db, parent, router):
+def _terminal_evidence(db, parent, router, *, provider=False):
     operation, attempt = parent['id'], parent['attempt']
     rows = db.execute('SELECT * FROM c_event WHERE operation=? ORDER BY seq', (operation,)).fetchall()
     events = [(r, json.loads(r['body'])) for r in rows]
@@ -163,24 +163,29 @@ def _terminal_evidence(db, parent, router):
     client = completed[1]['client_id']
     params = completed[1]['payload']['params']
     native = params['turn']
+    expected_error = native.get('error') if provider else CAPACITY_ERROR
+    if provider:
+        from .provider_recovery import ALLOWED_ERRORS
+        if not isinstance(expected_error, dict) or not isinstance(expected_error.get('codexErrorInfo'), str) or expected_error['codexErrorInfo'] not in ALLOWED_ERRORS or not isinstance(expected_error.get('message'), str) or not expected_error['message']:
+            raise IntegrationError('NOT_ALLOWED_PROVIDER_ERROR')
     if (not client or params['threadId'] != thread or native['id'] != turn or
-            native['status'] != 'failed' or native['error'] != CAPACITY_ERROR):
+            native['status'] != 'failed' or native['error'] != expected_error):
         raise IntegrationError('NOT_NATIVE_CAPACITY_FAILURE')
     if not isinstance(native.get('items'), list) or any(i.get('type') != 'userMessage' for i in native['items']):
         raise IntegrationError('CAPACITY_EFFECT_OBSERVED')
     error = one('STDOUT_RPC', lambda b: b.get('payload', {}).get('method') == 'error')
     params = error[1]['payload']['params']
     if (params['threadId'] != thread or params['turnId'] != turn or
-            params['error'] != CAPACITY_ERROR or params['willRetry'] is not False):
+            params['error'] != expected_error or params['willRetry'] is not False):
         raise IntegrationError('CAPACITY_NATIVE_ERROR_MISMATCH')
     outcome = one('TURN_OUTCOME')
     b = outcome[1]
     if (b['thread_id'] != thread or b['turn_id'] != turn or b['room_id'] != router.room or
-            b['turn_status'] != 'failed' or b['turn_error'] != CAPACITY_ERROR['message'] or
+            b['turn_status'] != 'failed' or b['turn_error'] != expected_error['message'] or
             b['settled_reply'] is not False or b['include_reply'] is not False or b['final_text'] != ''):
         raise IntegrationError('CAPACITY_SDK_OUTCOME_MISMATCH')
     runtime = one('RUNTIME_ERROR')
-    if runtime[1] != {'code': 'TurnResultAlreadyReported', 'diagnostic': CAPACITY_ERROR['message'], 'replay': 'FENCED'}:
+    if runtime[1] != {'code': 'TurnResultAlreadyReported', 'diagnostic': expected_error['message'], 'replay': 'FENCED'}:
         raise IntegrationError('CAPACITY_RUNTIME_MISMATCH')
     stopped = one('PROCESS_STOPPED')
     if stopped[1] != {'client_id': client, 'payload': {'members': []}}:
@@ -253,7 +258,12 @@ def _terminal_evidence(db, parent, router):
             db.execute("SELECT 1 FROM c_control WHERE operation=? AND (kind='cancel' OR state='PENDING')", (operation,)).fetchone() or
             db.execute('SELECT 1 FROM c_question WHERE operation=? AND answer IS NULL', (operation,)).fetchone()):
         raise IntegrationError('CAPACITY_CONTROL_PENDING_OR_CANCELLED')
-    reports, report_refs = _sdk_reports(db, parent, router, rows, events, start, accepted, completed, outcome, runtime, stopped)
+    if provider:
+        if db.execute('SELECT 1 FROM c_outbox WHERE operation=?', (operation,)).fetchone():
+            raise IntegrationError('PROVIDER_BUSINESS_EFFECT_OBSERVED')
+        reports, report_refs = [], []
+    else:
+        reports, report_refs = _sdk_reports(db, parent, router, rows, events, start, accepted, completed, outcome, runtime, stopped)
     for table in ('c_git_effect', 'c_callback', 'c_question'):
         if db.execute(f'SELECT 1 FROM {table} WHERE operation=?', (operation,)).fetchone():
             raise IntegrationError('CAPACITY_EFFECT_OBSERVED')
@@ -287,8 +297,16 @@ def _terminal_evidence(db, parent, router):
             if p['threadId'] != thread or p['turnId'] != turn or p['item']['type'] != 'userMessage':
                 raise IntegrationError('CAPACITY_EFFECT_OBSERVED')
         if r['kind'] == 'STDIN_RPC':
-            if method not in {'initialize', 'initialized', 'thread/resume', 'turn/start'}:
+            allowed_requests = {'initialize', 'initialized', 'thread/resume', 'turn/start'}
+            if provider:
+                allowed_requests.add('thread/start')
+            if method not in allowed_requests:
                 raise IntegrationError('CAPACITY_RPC_UNKNOWN')
+            if method == 'thread/start':
+                thread_params = frame['params']
+                if (thread_params.get('cwd') != router.workspace or thread_params.get('model') != params['model'] or
+                        thread_params.get('approvalPolicy') != 'on-request' or thread_params.get('sandbox') != 'workspace-write'):
+                    raise IntegrationError('CAPACITY_NATIVE_SCOPE_UNKNOWN')
             if method != 'initialized':
                 request_id = str(frame['id'])
                 if request_id in pending_requests:
@@ -307,8 +325,25 @@ def _terminal_evidence(db, parent, router):
                 raise IntegrationError('CAPACITY_RPC_UNKNOWN')
             if request == 'turn/start' and frame['result']['turn']['id'] != turn:
                 raise IntegrationError('CAPACITY_NATIVE_SCOPE_UNKNOWN')
+            if request in {'thread/start', 'thread/resume'} and frame['result']['thread']['id'] != thread:
+                raise IntegrationError('CAPACITY_NATIVE_SCOPE_UNKNOWN')
     if pending_requests:
         raise IntegrationError('CAPACITY_RPC_UNSETTLED')
+
+    # Native usage remains independently checked with SDK telemetry disabled.
+    counters = []
+    for r, b in events:
+        frame = b.get('payload', {})
+        if r['kind'] == 'STDOUT_RPC' and frame.get('method') == 'thread/tokenUsage/updated':
+            usage = frame['params']
+            if usage['threadId'] != thread or usage.get('turnId', turn) != turn:
+                raise IntegrationError('CAPACITY_NATIVE_SCOPE_UNKNOWN')
+            values = tuple(usage['tokenUsage']['total'][k] for k in ('inputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'))
+            if any(type(v) is not int or v < 0 for v in values):
+                raise IntegrationError('CAPACITY_REPORT_TOKEN_DELTA')
+            counters.append(values)
+    if counters and any(v != counters[0] for v in counters):
+        raise IntegrationError('CAPACITY_REPORT_TOKEN_DELTA')
 
     # Include all observed attempt events, not only the short terminal chain:
     # the full stream is what excludes callbacks and native tool execution.
@@ -319,13 +354,18 @@ def _terminal_evidence(db, parent, router):
     r = runtime_binding[0]
     refs.append({'seq': r['seq'], 'artifact_id': digest(r['body'].encode())})
     refs.extend(report_refs)
-    return {'classification': CLASSIFICATION, 'thread': thread, 'turn': turn, 'client_id': client,
+    return {'classification': 'SETTLED_NATIVE_PROVIDER_FAILURE' if provider else CLASSIFICATION, 'thread': thread, 'turn': turn, 'client_id': client,
             'model': params['model'], 'effort': params['effort'], 'run_settings_sha256': settings['hash'],
             'sdk_sha256': SDK_SHA256, 'report_types_sha256': REPORT_TYPES_SHA256,
-            'report_protocols_sha256': REPORT_PROTOCOLS_SHA256, 'acknowledged_sdk_reports': reports, 'evidence_refs': refs}
+            'report_protocols_sha256': REPORT_PROTOCOLS_SHA256, 'acknowledged_sdk_reports': reports, 'evidence_refs': refs, **({'provider_error': expected_error['codexErrorInfo']} if provider else {})}
 
 
 class CodexCapacityRecovery(Recovery):
+    classification = CLASSIFICATION
+    settled_event = 'SETTLED_NATIVE_CAPACITY'
+    def _terminal(self, db, parent):
+        return terminal_evidence(db, parent, self.router)
+
     def _authorized(self, db, operation):
         scope = self.router._scope(db)
         cap = (scope or {}).get('continuation')
@@ -341,7 +381,7 @@ class CodexCapacityRecovery(Recovery):
         if run and json.loads(run[0]).get('state') in {'UNKNOWN', 'DELIVERY_UNKNOWN', 'EFFECT_UNKNOWN', 'CLOSED_UNRESOLVED'}:
             raise IntegrationError('CAPACITY_RUN_UNRESOLVED')
         parent = super()._parent(db, operation, attempt, settled_interruption=True)
-        terminal_evidence(db, parent, self.router)
+        self._terminal(db, parent)
         return parent
 
     def recover(self, operation, attempt):
@@ -349,7 +389,7 @@ class CodexCapacityRecovery(Recovery):
             parent = self._parent(db, operation, attempt)
             old = db.execute('SELECT * FROM c_recovery WHERE operation=? AND attempt=?', (operation, attempt)).fetchone()
             prior_result = json.loads(parent['result']) if parent['result'] else {}
-            if old and prior_result.get('classification') == CLASSIFICATION and prior_result.get('evidence_id') == old['id']:
+            if old and prior_result.get('classification') == self.classification and prior_result.get('evidence_id') == old['id']:
                 observed = {'evidence_id': old['id']}
             else:
                 observed = None
@@ -357,7 +397,7 @@ class CodexCapacityRecovery(Recovery):
             observed = self.observe(operation, attempt)
             with self.owner.transaction(self.owner.epoch) as db:
                 parent = self._parent(db, operation, attempt)
-                terminal = terminal_evidence(db, parent, self.router)
+                terminal = self._terminal(db, parent)
                 for ref in terminal['evidence_refs']:
                     raw = db.execute('SELECT body FROM c_event WHERE seq=?', (ref['seq'],)).fetchone()[0].encode()
                     if Mailbox.artifact(db, raw) != ref['artifact_id']:
@@ -365,5 +405,5 @@ class CodexCapacityRecovery(Recovery):
                 receipt = {**observed, **terminal, 'acceptance': 'NOT_EVALUATED', 'replay': 'DO_NOT_REPEAT_ACKED_EFFECTS'}
                 db.execute("UPDATE c_work SET state='FAILED',delivery='RECONCILED',result=? WHERE id=? AND attempt=?", (encode(receipt), operation, attempt))
                 db.execute("UPDATE c_inbox SET life='RECONCILED' WHERE work=?", (operation,))
-                Mailbox.event(db, operation, 'SETTLED_NATIVE_CAPACITY', {'attempt': attempt, **receipt})
+                Mailbox.event(db, operation, self.settled_event, {'attempt': attempt, **receipt})
         return self.resume(operation, attempt, observed['evidence_id'])

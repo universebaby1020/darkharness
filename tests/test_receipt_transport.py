@@ -147,10 +147,17 @@ class ReceiptFacadeTests(unittest.TestCase):
             return original_start(thread)
         with patch('darkharness.integration.verification.threading.Thread.start', new=fail_checker):
             denied = self.verify(self.receipt)
-        self.assertFalse(denied.ok)
-        self.assertFalse(denied.value['same_input_safe_retry'])
-        self.assertNotEqual(denied.value['effect_phase'], 'NOT_STARTED')
-        self.assertEqual(self.bridge.broker.status(self.op, 'a', self.effect)['state'], 'UNKNOWN')
+        # WO08: a thread that demonstrably never started is a known failure,
+        # not uncertainty about a checker process or declared external effects.
+        self.assertTrue(denied.ok)
+        self.assertEqual(denied.value['state'], 'FAILED')
+        status = self.bridge.broker.status(self.op, 'a', self.effect)
+        self.assertEqual(status['result']['external_execution'], 'NOT_EXECUTED')
+        self.assertIsNotNone(self.bridge.complete(self.op, 'a', self.effect))
+        # A distinct genuinely unresolved historical effect must still override
+        # any new request's preflight diagnosis (run-wide fence is unchanged).
+        with self.owner.transaction(self.owner.epoch) as db:
+            db.execute("UPDATE c_verification_effect SET state='UNKNOWN' WHERE id=?", (self.effect,))
         self.tools.call_id = 'fresh-id'
         denied = self.verify('{')  # Even a preflight error must not hide old UNKNOWN.
         self.assertFalse(denied.value['same_input_safe_retry'])

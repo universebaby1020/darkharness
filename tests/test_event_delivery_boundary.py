@@ -16,6 +16,9 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
     deliver = fixture.CodexTests.deliver
     settle = fixture.CodexTests.settle
 
+    async def model_event(self, tools, content, message_type, metadata=None):
+        return await tools._send('send_event', {'content': content, 'message_type': message_type, 'metadata': metadata})
+
     async def test_serialized_metadata_cap_rejects_before_external_effect(self):
         from darkharness.integration.protected_tools import GuardedTools, LocalSendRejected
         op = self.box.receive('s', 'r', 'peer', 'oversize', 'task')['work']
@@ -25,7 +28,7 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
         for value in ('x' * 65536, '한' * 22000, '\\' * 33000):
             self.assertGreater(len(json.dumps({'diff': value}, ensure_ascii=False, separators=(',', ':')).encode()), 65536)
             with self.assertRaises(LocalSendRejected):
-                await tools.send_event('synthetic diff', 'task', {'diff': value})
+                await self.model_event(tools, 'synthetic diff', 'task', {'diff': value})
         self.assertEqual(self.tools.events, [])
         self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='DELIVERY_UNKNOWN'").fetchone()[0], 0)
         self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='REJECTED'").fetchone()[0], 3)
@@ -52,7 +55,8 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertEqual(self.client.turns, 1, 'next queued work must actually start')
         self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_work WHERE state='SUCCEEDED'").fetchone()[0], 2)
-        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='REJECTED'").fetchone()[0], 1)
+        self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='REJECTED'").fetchone()[0], 0)
+        self.assertEqual(crossed, [])
         self.assertFalse(any(m and len(json.dumps(m, ensure_ascii=False, separators=(',', ':')).encode()) > 65536 for m in crossed))
         self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='DELIVERY_UNKNOWN'").fetchone()[0], 0)
 
@@ -63,7 +67,7 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
         exc = httpx.HTTPStatusError('sensitive-body-must-not-be-recorded', request=httpx.Request('POST','https://example.invalid/events'), response=httpx.Response(503))
         self.tools.send_event = AsyncMock(side_effect=exc)
         with self.assertRaises(httpx.HTTPStatusError):
-            await GuardedTools(self.tools, self.adapter, op, 'a').send_event('safe', 'task')
+            await self.model_event(GuardedTools(self.tools, self.adapter, op, 'a'), 'safe', 'task')
         row = json.loads(self.owner.db.execute("SELECT body FROM c_event WHERE kind='DELIVERY_UNKNOWN'").fetchone()[0])['data']
         self.assertEqual(row['exception_class'], 'HTTPStatusError')
         self.assertEqual(row['http_status'], 503)
@@ -76,9 +80,9 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
         op=self.box.receive('s','r','peer','boundary','task')['work'];self.box.claim(op,'a')
         tools=GuardedTools(self.tools,self.adapter,op,'a')
         overhead=len(json.dumps({'diff':''},separators=(',',':')).encode())
-        await tools.send_event('exact','task',{'diff':'x'*(65536-overhead)})
+        await self.model_event(tools, 'exact','task',{'diff':'x'*(65536-overhead)})
         with self.assertRaises(LocalSendRejected):
-            await tools.send_event('over','task',{'diff':'x'*(65537-overhead)})
+            await self.model_event(tools, 'over','task',{'diff':'x'*(65537-overhead)})
         self.assertEqual(len(self.tools.events),1)
         self.assertEqual(self.owner.db.execute("SELECT COUNT(*) FROM c_outbox WHERE state='ACKED'").fetchone()[0],1)
 
@@ -91,7 +95,7 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
             raise TimeoutError('synthetic lost response')
         self.tools.send_event=lost
         with self.assertRaises(TimeoutError):
-            await GuardedTools(self.tools,self.adapter,op,'a').send_event('synthetic','task')
+            await self.model_event(GuardedTools(self.tools,self.adapter,op,'a'), 'synthetic','task')
         self.box.update(op,'a',state='SUCCEEDED',delivery='RETURNED')
         queued=self.box.receive('s','r','peer','next','next task')['work']
         self.assertEqual(len(stored),1)
@@ -108,17 +112,17 @@ class EventDeliveryTests(unittest.IsolatedAsyncioTestCase):
         tools=GuardedTools(self.tools,self.adapter,op,'a')
         self.tools.send_event=AsyncMock(return_value=None)
         with self.assertRaisesRegex(IntegrationError,'SEND_ACK_MISSING'):
-            await tools.send_event('missing','task')
+            await self.model_event(tools, 'missing','task')
         self.tools.send_event=AsyncMock(return_value={'secret':'sk-'+'x'*20})
         with self.assertRaisesRegex(IntegrationError,'OUTBOX_SECRET_BLOCKED'):
-            await tools.send_event('guarded','task')
+            await self.model_event(tools, 'guarded','task')
         self.tools.send_event=AsyncMock(return_value={'id':'synthetic-ack'})
         with patch.object(self.box,'sent',side_effect=sqlite3.OperationalError('synthetic lock')):
             with self.assertRaises(sqlite3.OperationalError):
-                await tools.send_event('db','task')
+                await self.model_event(tools, 'db','task')
         self.tools.send_event=AsyncMock(side_effect=asyncio.CancelledError())
         with self.assertRaises(asyncio.CancelledError):
-            await tools.send_event('cancel','task')
+            await self.model_event(tools, 'cancel','task')
         rows=[json.loads(r[0])['data'] for r in self.owner.db.execute("SELECT body FROM c_event WHERE kind='DELIVERY_UNKNOWN' ORDER BY seq")]
         self.assertEqual([r['phase'] for r in rows],['RECEIPT_VALIDATE','RECEIPT_GUARD','MAILBOX_SENT','RAW_SEND'])
         self.assertEqual(rows[-1]['exception_class'],'CancelledError')
