@@ -58,7 +58,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(tuple(before), tuple(self.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone()))
 
     def test_exact_error_allowlist_and_items_transport_fence(self):
-        for info in sorted(ALLOWED_ERRORS - {'usageLimitExceeded'}):
+        for info in ('serverOverloaded', 'internalServerError'):
             self.change_error(info)
             with self.owner.transaction(self.owner.epoch) as db:
                 proof = self.recovery._terminal(db, dict(db.execute('SELECT * FROM c_work WHERE id=?', (self.op,)).fetchone()))
@@ -71,6 +71,73 @@ class ProviderTests(unittest.TestCase):
         self.rpc('STDOUT_RPC', {'method': 'item/started', 'params': {'threadId': 'thread', 'turnId': 'turn', 'item': {'type': 'commandExecution', 'id': 'tool'}}})
         with self.assertRaisesRegex(IntegrationError, 'EFFECT_OBSERVED'):
             self.recovery.recover(self.op, 'a')
+
+    def test_native_tagged_variants_null_and_503_have_key_only_proof(self):
+        # Installed native v2/CodexErrorInfo.ts uses tagged objects, not strings.
+        for key in ('responseTooManyFailedAttempts', 'httpConnectionFailed'):
+            for status in (None, 503):
+                with self.subTest(key=key, status=status):
+                    self.change_error({key: {'httpStatusCode': status}})
+                    with self.owner.transaction(self.owner.epoch) as db:
+                        proof = self.recovery._terminal(db, self.box_parent(db))
+                    self.assertEqual(proof['provider_error'], key)
+                    self.assertNotIn('httpStatusCode', encode(proof))
+                    self.assertNotIn(ERROR['message'], encode(proof))
+
+    def box_parent(self, db):
+        return dict(db.execute('SELECT * FROM c_work WHERE id=?', (self.op,)).fetchone())
+
+    def test_tagged_retry_ledger_records_variant_not_message_or_payload(self):
+        self.change_error({'httpConnectionFailed': {'httpStatusCode': 503}})
+        result = self.recovery.recover(self.op, 'a')
+        self.assertEqual(result['ordinal'], 1)
+        ledger = self.owner.db.execute("SELECT body FROM c_event WHERE kind='SETTLED_NATIVE_PROVIDER'").fetchone()[0]
+        self.assertEqual(json.loads(ledger)['provider_error'], 'httpConnectionFailed')
+        self.assertNotIn(ERROR['message'], ledger)
+        self.assertNotIn('httpStatusCode', ledger)
+        self.assertEqual(json.loads(self.box.read_work(self.op)['result'])['provider_error'], 'httpConnectionFailed')
+
+    def test_malformed_tagged_stream_and_policy_errors_remain_fenced(self):
+        cases = ['responseTooManyFailedAttempts', 'httpConnectionFailed', 'cyberPolicy',
+                 'misalignmentPolicyViolation', 'tooManyDenials', 'unauthorized',
+                 'responseStreamConnectionFailed', 'responseStreamDisconnected',
+                 {'cyberPolicy': {}}, {'misalignmentPolicyViolation': {}},
+                 {'responseStreamConnectionFailed': {'httpStatusCode': 503}},
+                 {'responseStreamDisconnected': {'httpStatusCode': None}},
+                 {'httpConnectionFailed': {}, 'extra': {}},
+                 {'httpConnectionFailed': {}, 'cyberPolicy': {}},
+                 {'responseTooManyFailedAttempts': {}, 'extra': {}},
+                 {'httpConnectionFailed': None}, {'responseTooManyFailedAttempts': []},
+                 {'httpConnectionFailed': '503'}, {}, None, []]
+        for info in cases:
+            with self.subTest(info=info):
+                self.change_error(info)
+                with self.assertRaisesRegex(IntegrationError, 'NOT_ALLOWED_PROVIDER_ERROR'):
+                    self.recovery.recover(self.op, 'a')
+                self.assertEqual(self.box.read_work(self.op)['delivery'], 'DELIVERY_UNKNOWN')
+                self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_work').fetchone()[0], 1)
+                self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_provider_retry').fetchone()[0], 0)
+
+    def test_error_frame_and_turn_error_must_match_entire_tagged_object(self):
+        self.change_error({'httpConnectionFailed': {'httpStatusCode': None}})
+        row = next(r for r in self.owner.db.execute('SELECT seq,body FROM c_event')
+                   if json.loads(r['body']).get('data', {}).get('payload', {}).get('method') == 'error')
+        body = json.loads(row['body'])
+        error = body['data']['payload']['params']['error']
+        original = json.loads(encode(error))
+        for info in ({'httpConnectionFailed': {'httpStatusCode': 503}},
+                     {'responseTooManyFailedAttempts': {'httpStatusCode': None}}, 'cyberPolicy'):
+            with self.subTest(info=info):
+                error['codexErrorInfo'] = info
+                self.owner.db.execute('UPDATE c_event SET body=? WHERE seq=?', (encode(body), row['seq']))
+                with self.assertRaisesRegex(IntegrationError, 'NATIVE_ERROR_MISMATCH'):
+                    self.recovery.recover(self.op, 'a')
+        body['data']['payload']['params']['error'] = original
+        body['data']['payload']['params']['willRetry'] = True
+        self.owner.db.execute('UPDATE c_event SET body=? WHERE seq=?', (encode(body), row['seq']))
+        with self.assertRaisesRegex(IntegrationError, 'NATIVE_ERROR_MISMATCH'):
+            self.recovery.recover(self.op, 'a')
+        self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_work').fetchone()[0], 1)
 
     def test_actual_closed_transport_and_business_acks_never_retry(self):
         self.rpc('STDOUT_RPC', {'method': 'transport/closed', 'params': {}})

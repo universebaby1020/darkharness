@@ -18,6 +18,41 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL = Path(os.environ.get("DH_OFFICIAL_ROOT", str(ROOT / "inputs/handoff-20261001/DarkHarness_Opus55_Codex_Handoff_20261001/official/dark-factory-803560d2a678")))
 
 
+PLAIN_VALIDATION = ('Describe negative tests, invalid input checks and rejection checks in plain data validation terms: state which input is invalid, inconsistent, unsupported or out of range, which requirement it breaks, and the expected rejection and unchanged state, in test and script names, code comments, findings, handoffs and relayed summaries alike.')
+EXACT_QUOTES = ('Neutral wording never narrows, hides or weakens what is tested or found; quote supplied requirements, commands and tool output exactly as given.')
+
+
+class MandateEvidenceWordingTests(unittest.TestCase):
+    def test_exact_two_sentences_in_evidence_reporting_for_all_three_seats(self):
+        for role in ('coordinator', 'builder', 'reviewer'):
+            with self.subTest(role=role):
+                text = render_mandate('dh ' + role, role, 'DarkHarness (Band SDK Codex)', 'gpt-6-astra', 'high')
+                expected = ('## Evidence reporting\nReport actual commands, results and Git revision. '
+                            + PLAIN_VALIDATION + ' ' + EXACT_QUOTES + ' '
+                            + 'Distinguish untested work and uncertain effects from success.')
+                self.assertIn(expected, text)
+                self.assertEqual(text.count(PLAIN_VALIDATION), 1)
+                self.assertEqual(text.count(EXACT_QUOTES), 1)
+                raw = text.encode('utf-8')
+                snapshot_check(text, raw, digest(raw))
+                old = text.replace(PLAIN_VALIDATION + ' ' + EXACT_QUOTES + ' ', '')
+                self.assertNotEqual(digest(raw), digest(old.encode('utf-8')))
+
+    def test_quote_preservation_directive_and_literal_snapshot_readback(self):
+        text = render_mandate('dh reviewer', 'reviewer', 'DarkHarness (Band SDK Codex)', 'gpt-6-astra', 'high')
+        self.assertIn(EXACT_QUOTES, text)
+        # Snapshot verification is byte-exact, not a rewrite of supplied evidence.
+        # This does not claim that a model will follow the quoting instruction.
+        supplied = '\nRequirement: "Reject invalid input; leave state unchanged."\nCommand: python -m unittest -v\nTool output: FAILED (errors=1) — 원문\n'
+        runtime = text + supplied
+        raw = runtime.encode('utf-8')
+        snapshot_check(runtime, raw, digest(raw))
+        self.assertEqual(raw.decode('utf-8')[-len(supplied):], supplied)
+        changed = raw.replace(b'FAILED (errors=1)', b'OK')
+        with self.assertRaisesRegex(IntegrationError, 'MANDATE_SNAPSHOT_MISMATCH'):
+            snapshot_check(runtime, changed, digest(raw))
+
+
 @unittest.skipUnless((OFFICIAL / "harness/check.py").is_file(), "trusted official checkout unavailable")
 class ArtifactTests(unittest.TestCase):
     @classmethod

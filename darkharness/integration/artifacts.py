@@ -122,6 +122,8 @@ def render_mandate(name, role, harness, model, effort):
             "## UI quality\nFor applicable UI work, use the provided read-only design pack "
             "and any UI quality helper granted for this run; follow the task specification and existing authority.\n\n"
             "## Evidence reporting\nReport actual commands, results and Git revision. "
+            "Describe negative tests, invalid input checks and rejection checks in plain data validation terms: state which input is invalid, inconsistent, unsupported or out of range, which requirement it breaks, and the expected rejection and unchanged state, in test and script names, code comments, findings, handoffs and relayed summaries alike. "
+            "Neutral wording never narrows, hides or weakens what is tested or found; quote supplied requirements, commands and tool output exactly as given. "
             "Distinguish untested work and uncertain effects from success. An outbox DELIVERY_UNKNOWN "
             "between SEND_INTENT and SEND_ACK is normal pre-ACK send progress, not proof of a failed send. "
             "If it remains unresolved, preserve the delivery fence. Never replay "

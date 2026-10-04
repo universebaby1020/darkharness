@@ -165,8 +165,11 @@ def _terminal_evidence(db, parent, router, *, provider=False):
     native = params['turn']
     expected_error = native.get('error') if provider else CAPACITY_ERROR
     if provider:
-        from .provider_recovery import ALLOWED_ERRORS
-        if not isinstance(expected_error, dict) or not isinstance(expected_error.get('codexErrorInfo'), str) or expected_error['codexErrorInfo'] not in ALLOWED_ERRORS or not isinstance(expected_error.get('message'), str) or not expected_error['message']:
+        from .provider_recovery import provider_error_variant
+        if not isinstance(expected_error, dict) or not isinstance(expected_error.get('message'), str) or not expected_error['message']:
+            raise IntegrationError('NOT_ALLOWED_PROVIDER_ERROR')
+        variant = provider_error_variant(expected_error.get('codexErrorInfo'))
+        if variant is None:
             raise IntegrationError('NOT_ALLOWED_PROVIDER_ERROR')
     if (not client or params['threadId'] != thread or native['id'] != turn or
             native['status'] != 'failed' or native['error'] != expected_error):
@@ -357,7 +360,7 @@ def _terminal_evidence(db, parent, router, *, provider=False):
     return {'classification': 'SETTLED_NATIVE_PROVIDER_FAILURE' if provider else CLASSIFICATION, 'thread': thread, 'turn': turn, 'client_id': client,
             'model': params['model'], 'effort': params['effort'], 'run_settings_sha256': settings['hash'],
             'sdk_sha256': SDK_SHA256, 'report_types_sha256': REPORT_TYPES_SHA256,
-            'report_protocols_sha256': REPORT_PROTOCOLS_SHA256, 'acknowledged_sdk_reports': reports, 'evidence_refs': refs, **({'provider_error': expected_error['codexErrorInfo']} if provider else {})}
+            'report_protocols_sha256': REPORT_PROTOCOLS_SHA256, 'acknowledged_sdk_reports': reports, 'evidence_refs': refs, **({'provider_error': variant} if provider else {})}
 
 
 class CodexCapacityRecovery(Recovery):

@@ -263,7 +263,7 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.events('ATTEMPT_PROCESS_CLEAN'))
         self.assertFalse(self.events('TURN_ACCEPTED'))
 
-    async def test_third_prestart_failure_drains_next_work_and_schedules_coordinator(self):
+    async def test_fourth_prestart_failure_drains_next_work_and_schedules_coordinator(self):
         # Exercise actual SDK runner/owned process retirement, not classifier-only
         # rows. Only the clock is advanced; production backoff remains 60 seconds.
         from darkharness.integration.codex import OwnedStdioClient
@@ -285,7 +285,7 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         failures = 0
         async def request(client, method, params=None, **kwargs):
             nonlocal failures
-            if method == 'thread/start' and failures < 3:
+            if method == 'thread/start' and failures < 4:
                 failures += 1
                 raise RuntimeError('fixture prestart')
             return await original(client, method, params, **kwargs)
@@ -297,12 +297,19 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
             # Queue while the original is waiting. On the final failure this must
             # run without another incoming platform message or manual wake.
             next_op = self.fixture.box.receive('s', 'r', 'peer', 'next', 'next independent work')['work']
-            for _ in range(2):
+            for retry in range(3):
                 self.fixture.owner.db.execute('UPDATE c_retry_wait SET not_before=0 WHERE operation=?', (blocked,))
                 self.adapter._wake()
                 await self.settle()
+                if retry == 1:
+                    row = f.box.read_work(blocked)
+                    self.assertEqual((row['state'], row['delivery']), ('QUEUED', 'READY'))
+                    self.assertEqual(json.loads(row['result'])['failures'], 3)
+                    self.assertEqual(notifications, [])
         waits = [call.args[0] for call in scheduled.call_args_list if len(call.args) > 1 and call.args[1] == self.adapter._wake]
-        self.assertEqual(waits, [60, 60])
+        self.assertEqual(waits, [60, 60, 60])
+        self.assertEqual(failures, 4)
+        self.assertEqual(json.loads(f.box.read_work(blocked)['result'])['failures'], 4)
         self.assertEqual(self.fixture.box.read_work(blocked)['state'], 'FAILED')
         self.assertEqual(self.fixture.box.read_work(next_op)['state'], 'SUCCEEDED')
         self.assertIn('wake', notifications)
@@ -316,6 +323,27 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fixture.owner.db.execute('SELECT COUNT(*) FROM c_outbox').fetchone()[0], 0)
 
     async def test_provider_first_dispatch_real_sdk_backoff_and_child_start(self):
+        await self.provider_dispatch('serverOverloaded')
+
+    async def test_provider_http_null_real_sdk_backoff_and_child_start(self):
+        await self.provider_dispatch({'httpConnectionFailed': {'httpStatusCode': None}})
+
+    async def test_provider_http_503_real_sdk_backoff_and_child_start(self):
+        await self.provider_dispatch({'httpConnectionFailed': {'httpStatusCode': 503}})
+
+    async def test_provider_failed_attempts_null_real_sdk_backoff_and_child_start(self):
+        await self.provider_dispatch({'responseTooManyFailedAttempts': {'httpStatusCode': None}})
+
+    async def test_provider_failed_attempts_503_real_sdk_backoff_and_child_start(self):
+        await self.provider_dispatch({'responseTooManyFailedAttempts': {'httpStatusCode': 503}})
+
+    async def test_provider_policy_refusal_real_sdk_never_creates_retry_or_fresh_thread(self):
+        await self.provider_dispatch('cyberPolicy', refused=True)
+
+    async def test_provider_object_policy_real_sdk_never_creates_retry_or_fresh_thread(self):
+        await self.provider_dispatch({'cyberPolicy': {}}, refused=True)
+
+    async def provider_dispatch(self, info, *, refused=False):
         from darkharness.integration.provider_recovery import prepare_settled_provider_recovery, register_policy
         from darkharness.integration.mailbox import encode, digest
         from datetime import datetime, timezone
@@ -335,13 +363,29 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         f.owner.db.execute('INSERT INTO c_run_settings VALUES(?,?,?)', ('run', body, digest(body.encode())))
         with f.owner.transaction(f.owner.epoch) as db:
             f.box.event(db, None, 'RUNTIME_BINDINGS', {'run_id': 'run', 'bindings': [{'settings_sha256': 'fixture-settings', 'runtime': 'codex', 'workspace': str(f.repo), 'model': 'test-model', 'effort': 'high'}]})
-        source = wiring.RPC_SERVER.replace("if args and not marker.exists():", "if not marker.exists():\n   marker.touch()\n   error={'message':'fixture overloaded','codexErrorInfo':'serverOverloaded'}\n   print(json.dumps({'method':'error','params':{'threadId':thread,'turnId':'turn','error':error,'willRetry':False}}),flush=True)\n   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn','status':'failed','error':error,'items':[]}}}),flush=True)\n  elif args and not marker.exists():")
+        error = {'message': 'fixture provider failure', 'codexErrorInfo': info}
+        source = wiring.RPC_SERVER.replace("if args and not marker.exists():", "if not marker.exists():\n   marker.touch()\n   error=" + repr(error) + "\n   print(json.dumps({'method':'error','params':{'threadId':thread,'turnId':'turn','error':error,'willRetry':False}}),flush=True)\n   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn','status':'failed','error':error,'items':[]}}}),flush=True)\n  elif args and not marker.exists():")
         before = tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone())
         with patch.object(wiring, 'RPC_SERVER', source):
             msg = PlatformMessage('dispatch', 'r', content, 'human', 'User', 'fixture human', 'text', {}, datetime.now(timezone.utc))
             await self.adapter.on_message(msg, self.tools, CodexSessionState(), None, None, is_session_bootstrap=True, room_id='r')
             await self.settle()
             rows = f.owner.db.execute("SELECT * FROM c_work WHERE seat='s' ORDER BY rowid").fetchall()
+            if refused:
+                self.assertEqual(len(rows), 2)  # initial completed fixture + fenced parent only
+                self.assertEqual(rows[-1]['delivery'], 'DELIVERY_UNKNOWN')
+                self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_provider_retry').fetchone()[0], 0)
+                self.assertTrue(self.events('PROVIDER_RECOVERY_BLOCKED'))
+                self.assertIsNone(f.box.next_ready('s'))
+                # A manual wake must not create a fresh thread or hide refusal.
+                self.adapter._wake()
+                await self.settle()
+                starts = [e for e in self.events('STDIN_RPC') if e['payload'].get('method') == 'thread/start']
+                self.assertEqual(len(starts), 1)
+                self.assertEqual(len(self.events('TURN_ACCEPTED')), 1)
+                self.assertEqual(before, tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone()))
+                self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_outbox').fetchone()[0], 0)
+                return
             self.assertEqual(len(rows), 3, self.events('PROVIDER_RECOVERY_BLOCKED'))  # initial completed fixture + parent + child
             parent, child = rows[-2:]
             self.assertEqual(parent['delivery'], 'RECONCILED')

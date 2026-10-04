@@ -12,9 +12,25 @@ from .codex_capacity import CodexCapacityRecovery, terminal_evidence
 from .codex_timeout import prepare_settled_timeout_recovery
 from .mailbox import IntegrationError, Mailbox, digest, encode
 
-ALLOWED_ERRORS = frozenset({'serverOverloaded', 'usageLimitExceeded',
-    'responseTooManyFailedAttempts', 'httpConnectionFailed', 'internalServerError'})
+ALLOWED_ERRORS = frozenset({'serverOverloaded', 'usageLimitExceeded', 'internalServerError'})
+TAGGED_ERRORS = frozenset({'responseTooManyFailedAttempts', 'httpConnectionFailed'})
 BACKOFF = [60, 180, 300]
+
+
+def provider_error_variant(info):
+    """Narrow native schema allowlist, independent of SDK retryable hints.
+
+    Only these unit strings or single-key tagged objects are transient. Policy
+    refusals and responseStream variants never enter recovery. Return the key
+    alone for the ledger, not the upstream message or tagged payload.
+    """
+    if isinstance(info, str):
+        return info if info in ALLOWED_ERRORS else None
+    if isinstance(info, dict) and len(info) == 1:
+        key = next(iter(info))
+        if key in TAGGED_ERRORS and isinstance(info[key], dict):
+            return key
+    return None
 
 
 def prepare_settled_provider_recovery(scope, *, run_id, workspace, rooms, seats, dispatch_sender, dispatch_room, dispatch_sha256):

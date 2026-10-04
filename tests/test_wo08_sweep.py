@@ -81,19 +81,100 @@ class UnstartedTests(unittest.TestCase):
     def rpc(self, kind, frame):
         self.box.observe(self.op, 'a', kind, {'client_id': 'client', 'payload': frame})
 
-    def test_before_intent_and_three_failures(self):
-        for n in range(1, 4):
+    def test_before_intent_three_retries_four_total_failures(self):
+        for n in range(1, 5):
+            attempt = 'a' if n == 1 else 'a' + str(n)
             if n > 1:
                 self.owner.db.execute('UPDATE c_retry_wait SET not_before=0')
-                self.box.claim(self.op, 'a')
-            result = self.box.release_unstarted(self.op, 'a', 'fixture')
+                self.box.claim(self.op, attempt)
+                self.box.observe(self.op, attempt, 'ATTEMPT_PROCESS_CLEAN', {'proof': 'fixture'})
+            result = self.box.release_unstarted(self.op, attempt, 'fixture')
             self.assertEqual(result['failures'], n)
-            self.assertEqual(result['terminal'], n == 3)
+            self.assertEqual(result['terminal'], n == 4)
+            self.assertEqual(result['backoff_s'], 60)
             self.assertIsNone(self.box.next_ready('s'))
         self.assertEqual(self.box.read_work(self.op)['delivery'], 'RETURNED')
-        child = self.box.notify_peer_blocker(self.op, 'a', 'coordinator', 'r', 'run')
+        child = self.box.notify_peer_blocker(self.op, 'a4', 'coordinator', 'r', 'run')
         self.assertIn('FENCED', self.box.read_work(child)['input'])
-        self.assertEqual(child, self.box.notify_peer_blocker(self.op, 'a', 'coordinator', 'r', 'run'))
+        self.assertEqual(child, self.box.notify_peer_blocker(self.op, 'a4', 'coordinator', 'r', 'run'))
+
+    def test_consecutive_count_persists_across_closed_owner_restarts(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'owner.sqlite')
+            owner = Owner(path)
+            try:
+                box = Mailbox(owner)
+                op = box.receive('s', 'r', 'peer', 'persistent', 'same task')['work']
+                for n in range(1, 5):
+                    attempt = 'attempt-' + str(n)
+                    box.claim(op, attempt)
+                    box.observe(op, attempt, 'ATTEMPT_PROCESS_CLEAN', {'proof': 'fixture'})
+                    # First failure uses ordinary release; the other three are
+                    # classified after an actual close/reopen of the owner DB.
+                    if n == 1:
+                        self.assertFalse(box.release_unstarted(op, attempt, 'fixture')['terminal'])
+                    else:
+                        owner.db.close()
+                        owner = Owner(path)
+                        box = Mailbox(owner)
+                        self.assertEqual(box.recover(), [op])
+                    row = box.read_work(op)
+                    self.assertEqual(json.loads(row['result'])['failures'], n)
+                    self.assertEqual((row['state'], row['delivery']),
+                                     ('FAILED', 'RETURNED') if n == 4 else ('QUEUED', 'READY'))
+                    wait = owner.db.execute('SELECT failures,not_before FROM c_retry_wait WHERE operation=?', (op,)).fetchone()
+                    self.assertEqual(wait['failures'], n)
+                    self.assertGreater(wait['not_before'], time.time() + 55)
+                    self.assertIsNone(box.next_ready('s'))
+                    self.assertEqual(box.recover(), [])  # no double counting
+                    owner.db.execute('UPDATE c_retry_wait SET not_before=0 WHERE operation=?', (op,))
+                next_op = box.receive('s', 'r', 'peer', 'next', 'next task')['work']
+                self.assertEqual(box.next_ready('s')['id'], next_op)
+                child = box.notify_peer_blocker(op, attempt, 'coordinator', 'r', 'run')
+                self.assertEqual(box.next_ready('coordinator')['id'], child)
+            finally:
+                owner.db.close()
+
+    def test_completed_work_is_never_released_or_retried_on_restart(self):
+        self.box.update(self.op, 'a', state='SUCCEEDED', delivery='RETURNED', result={'completed': True})
+        before = self.box.read_work(self.op)
+        self.assertIsNone(self.box.release_unstarted(self.op, 'a', 'late failure'))
+        self.assertEqual(self.box.recover(), [])
+        self.assertEqual(self.box.read_work(self.op), before)
+        self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_retry_wait').fetchone()[0], 0)
+
+    def test_effect_and_cancel_predicates_fence_restart_as_well_as_release(self):
+        cases = ('TURN_ACCEPTED', 'PROCESS_STOP_UNKNOWN', 'callback', 'question',
+                 'outbox', 'git', 'verification', 'cancel')
+        for case in cases:
+            with self.subTest(case=case):
+                owner = Owner()
+                try:
+                    box = Mailbox(owner)
+                    op = box.receive('s', 'r', 'peer', case, 'task')['work']
+                    box.claim(op, 'a')
+                    box.observe(op, 'a', 'ATTEMPT_PROCESS_CLEAN', {})
+                    if case in ('TURN_ACCEPTED', 'PROCESS_STOP_UNKNOWN'):
+                        box.observe(op, 'a', case, {})
+                    elif case == 'callback':
+                        box.callback(op, 'a', 'callback', {})
+                    elif case == 'question':
+                        box.question('q', op, 'peer', {})
+                    elif case == 'outbox':
+                        box.prepare_send('out', op, {'content': 'fixture'})
+                    elif case in ('git', 'verification'):
+                        table = 'c_git_effect' if case == 'git' else 'c_verification_effect'
+                        owner.db.execute(f'CREATE TABLE {table}(operation TEXT,attempt TEXT)')
+                        owner.db.execute(f'INSERT INTO {table} VALUES(?,?)', (op, 'a'))
+                    else:
+                        box.control('cancel', op, 'a', 'cancel', {})
+                    self.assertIsNone(box.release_unstarted(op, 'a', 'fixture'))
+                    box.recover()
+                    self.assertEqual(box.read_work(op)['delivery'], 'DELIVERY_UNKNOWN')
+                    self.assertEqual(owner.db.execute('SELECT COUNT(*) FROM c_retry_wait').fetchone()[0], 0)
+                finally:
+                    owner.db.close()
 
     def test_definitive_same_rpc_error_only(self):
         self.box.observe(self.op, 'a', 'TURN_START_INTENT', {})

@@ -22,7 +22,8 @@ Grant는 dispatch 전에 준비하고 run 종료까지 고정한다. 기존 Cont
   단일 definitive error 응답이 필요하다. intent→요청→응답 순서, RPC id 타입과
   정형 error code/message도 대조한다. 이전 응답 재사용·malformed error,
   sent-without-reply와 TURN_ACCEPTED는 fence다.
-  60초 후 같은 작업을 다시 깨우고 연속 세 번째는 FAILED/RETURNED로 끝낸다.
+  60초 후 같은 작업을 다시 깨우고 재시도는 세 번까지 허용한다. 최초 실행을 포함한
+  연속 네 번째 실패에서 FAILED/RETURNED로 끝낸다. owner 재시작에도 횟수는 유지한다.
   재시작 자체는 cessation 증거가 아니다. coordinator 알림은 내부 evidence work다.
 - SDK4 send 경계는 call-local REST facade로 max_retries=0을 전달한다. 공유 SDK 객체나
   설치 소스는 바꾸지 않는다. typed connect failure와 400/403/404/413/422만
@@ -85,9 +86,12 @@ owner의 `c_provider_policy`에 body/hash/등록시각을 immutable하게 보관
 rewrite하지 않는다. 복구 직전 pinned policy와 scope를 일치시키고 dispatch artifact의
 hash/run/policy/platform id/sender/room/content hash/시각을 readback한다.
 
-허용 native codexErrorInfo 문자열은 정확히 다음 다섯 개다:
-serverOverloaded, usageLimitExceeded, responseTooManyFailedAttempts,
-httpConnectionFailed, internalServerError. error 객체의 다른 schema/transport closed,
+허용 native codexErrorInfo 문자열은 serverOverloaded, usageLimitExceeded,
+internalServerError 세 개다. responseTooManyFailedAttempts와 httpConnectionFailed는
+키가 정확히 하나이고 그 값이 객체인 tagged object만 허용한다. 문자열 형태의 두
+변형은 허용하지 않는다. 원장에는 payload 대신 변형 키만 남기며 error 프레임과
+turn.error 전체 객체의 동일성도 검사한다. responseStream 변형과 안전 거절은
+대상에 포함하지 않는다. error 객체의 다른 schema/transport closed,
 userMessage 외 native item, callback, 업무 outbox(ACK도 포함), Git/checker/question,
 미응답 RPC, cessation/source/settings 불명은 기존 fence다. 첫 dispatch의 thread/start는
 provider 경로에서만 cwd/model/on-request/workspace-write와 응답 owned thread를 대조하여

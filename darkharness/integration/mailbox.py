@@ -198,7 +198,8 @@ class Mailbox:
                 return None
             prior = db.execute('SELECT failures FROM c_retry_wait WHERE operation=?', (operation,)).fetchone()
             n = (prior[0] if prior else 0) + 1
-            terminal = n >= 3
+            # Three retries beyond the first attempt: fail on failure four.
+            terminal = n >= 4
             due = time.time() + 60
             db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (operation, n, due))
             state, delivery = ('FAILED', 'RETURNED') if terminal else ('QUEUED', 'READY')
@@ -235,7 +236,7 @@ class Mailbox:
                     n = (prior[0] if prior else 0) + 1
                     due = datetime.now(timezone.utc).timestamp() + 60
                     db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (row[0], n, due))
-                    state, delivery = ('FAILED', 'RETURNED') if n >= 3 else ('QUEUED', 'READY')
+                    state, delivery = ('FAILED', 'RETURNED') if n >= 4 else ('QUEUED', 'READY')
                     db.execute('UPDATE c_work SET state=?,delivery=?,result=? WHERE id=?', (state, delivery, encode({'effect': 'NOT_STARTED', 'code': 'OWNER_RESTART', 'failures': n}), row[0]))
                     db.execute('UPDATE c_inbox SET life=? WHERE work=?', (delivery, row[0]))
                     self.event(db, row[0], 'NOT_STARTED_RECOVERED', {'attempt': row[1], 'failures': n, 'not_before': due})
