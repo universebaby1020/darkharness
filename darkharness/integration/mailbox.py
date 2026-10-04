@@ -26,6 +26,7 @@ def digest(value: bytes):
 
 LIFE = ("RECEIVED", "ASSEMBLED", "READY", "STARTED", "RETURNED", "RECONCILED")
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "CLOSED_UNRESOLVED"}
+MAX_PRESTART_FAILURES = 4  # First attempt plus three retries.
 
 
 @dataclass(frozen=True)
@@ -199,7 +200,7 @@ class Mailbox:
             prior = db.execute('SELECT failures FROM c_retry_wait WHERE operation=?', (operation,)).fetchone()
             n = (prior[0] if prior else 0) + 1
             # Three retries beyond the first attempt: fail on failure four.
-            terminal = n >= 4
+            terminal = n >= MAX_PRESTART_FAILURES
             due = time.time() + 60
             db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (operation, n, due))
             state, delivery = ('FAILED', 'RETURNED') if terminal else ('QUEUED', 'READY')
@@ -218,8 +219,9 @@ class Mailbox:
             child = digest(encode([run_id, operation, attempt, 'peer-blocker']).encode())
             evidence = {'operation': operation, 'attempt': attempt, 'seat': work['seat'], 'state': work['state'], 'delivery': work['delivery'], 'result_ref': self.artifact(db, (work['result'] or '{}').encode()), 'replay': 'FENCED'}
             body = {'content': encode({'peer_blocker': evidence}), 'internal_evidence': True, 'run_id': run_id}
-            db.execute("INSERT OR IGNORE INTO c_work VALUES(?,?,?,?,NULL,'QUEUED','READY',NULL,NULL)", (child, seat, room, encode(body)))
-            self.event(db, operation, 'COORDINATOR_BLOCKER_QUEUED', {'attempt': attempt, 'child': child, 'result_ref': evidence['result_ref']})
+            inserted = db.execute("INSERT OR IGNORE INTO c_work VALUES(?,?,?,?,NULL,'QUEUED','READY',NULL,NULL)", (child, seat, room, encode(body)))
+            if inserted.rowcount == 1:
+                self.event(db, operation, 'COORDINATOR_BLOCKER_QUEUED', {'attempt': attempt, 'child': child, 'result_ref': evidence['result_ref']})
             return child
 
     def recover(self):
@@ -236,7 +238,7 @@ class Mailbox:
                     n = (prior[0] if prior else 0) + 1
                     due = datetime.now(timezone.utc).timestamp() + 60
                     db.execute('INSERT OR REPLACE INTO c_retry_wait VALUES(?,?,?)', (row[0], n, due))
-                    state, delivery = ('FAILED', 'RETURNED') if n >= 4 else ('QUEUED', 'READY')
+                    state, delivery = ('FAILED', 'RETURNED') if n >= MAX_PRESTART_FAILURES else ('QUEUED', 'READY')
                     db.execute('UPDATE c_work SET state=?,delivery=?,result=? WHERE id=?', (state, delivery, encode({'effect': 'NOT_STARTED', 'code': 'OWNER_RESTART', 'failures': n}), row[0]))
                     db.execute('UPDATE c_inbox SET life=? WHERE work=?', (delivery, row[0]))
                     self.event(db, row[0], 'NOT_STARTED_RECOVERED', {'attempt': row[1], 'failures': n, 'not_before': due})

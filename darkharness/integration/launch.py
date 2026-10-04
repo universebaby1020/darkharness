@@ -344,13 +344,9 @@ class SeatManager:
                 self.runtimes.append(runtime)
                 self.agents.append(agent)
                 bindings.append(asdict(binding))
-                # Mailbox restart can settle a proven unstarted third failure
+                # Mailbox restart can settle the fourth proven unstarted failure
                 # before adapters exist. Deliver its internal blocker now.
-                if hasattr(adapter, '_notify_blocker'):
-                    with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
-                        blocked = db.execute("SELECT id,attempt FROM c_work WHERE seat=? AND (state='FAILED' OR delivery='DELIVERY_UNKNOWN')", (adapter.alias,)).fetchall()
-                    for work in blocked:
-                        adapter._notify_blocker(work['id'], work['attempt'])
+                self.notify_startup_blockers(adapter)
             # Historical timeout proof is evaluated before readiness can create
             # new native processes. No SQLite edits or synthetic Band dispatch.
             self.recover_timeouts_on_startup()
@@ -399,6 +395,14 @@ class SeatManager:
                 if isinstance(client, OwnedStdioClient) and getattr(client, 'evidence', None) and client.evidence.context is None and client.group is not None:
                     found.update(identity[0] for identity in group_members(client.group))
         return found
+
+    def notify_startup_blockers(self, adapter):
+        """Deliver durable terminal/fenced work once adapters become available."""
+        if hasattr(adapter, '_notify_blocker'):
+            with self.mailbox.owner.transaction(self.mailbox.owner.epoch) as db:
+                blocked = db.execute("SELECT id,attempt FROM c_work WHERE seat=? AND (state='FAILED' OR delivery='DELIVERY_UNKNOWN')", (adapter.alias,)).fetchall()
+            for work in blocked:
+                adapter._notify_blocker(work['id'], work['attempt'])
 
     def recover_timeouts_on_startup(self):
         results = []

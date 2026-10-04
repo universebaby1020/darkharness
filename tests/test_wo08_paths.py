@@ -312,7 +312,8 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(f.box.read_work(blocked)['result'])['failures'], 4)
         self.assertEqual(self.fixture.box.read_work(blocked)['state'], 'FAILED')
         self.assertEqual(self.fixture.box.read_work(next_op)['state'], 'SUCCEEDED')
-        self.assertIn('wake', notifications)
+        self.assertEqual(notifications, ['wake', 'wake'])  # finally also wakes; only one durable notice
+        self.assertEqual(f.owner.db.execute("SELECT COUNT(*) FROM c_event WHERE kind='COORDINATOR_BLOCKER_QUEUED'").fetchone()[0], 1)
         row = self.fixture.owner.db.execute("SELECT * FROM c_work WHERE input LIKE '%peer_blocker%'").fetchone()
         self.assertIsNotNone(row)
         self.assertTrue(json.loads(row['input'])['internal_evidence'])
@@ -343,7 +344,10 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_object_policy_real_sdk_never_creates_retry_or_fresh_thread(self):
         await self.provider_dispatch({'cyberPolicy': {}}, refused=True)
 
-    async def provider_dispatch(self, info, *, refused=False):
+    async def test_effectful_refusal_still_one_blocker_and_no_recovery(self):
+        await self.provider_dispatch('cyberPolicy', refused=True, effects=True)
+
+    async def provider_dispatch(self, info, *, refused=False, effects=False):
         from darkharness.integration.provider_recovery import prepare_settled_provider_recovery, register_policy
         from darkharness.integration.mailbox import encode, digest
         from datetime import datetime, timezone
@@ -354,6 +358,11 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         from band.runtime.formatters import replace_uuid_mentions
         roster = [{'id': '00000000-0000-4000-8000-000000000003', 'handle': 'synthetic-builder', 'name': 'Synthetic Builder', 'type': 'Agent'}]
         content = replace_uuid_mentions('@[[00000000-0000-4000-8000-000000000003]] original provider task', roster)
+        if refused:
+            from darkharness.integration.codex_timeout import prepare_settled_timeout_recovery
+            grant['scope'] = prepare_settled_timeout_recovery(grant['scope'], run_id='run', workspace=str(f.repo), rooms=['r'], seats=['s'])
+            self.adapter.auto_recover_settled_timeouts = True
+            self.adapter.coordinator_notify = lambda operation, attempt: f.box.notify_peer_blocker(operation, attempt, 'peer', 'r', 'run')
         grant['scope'] = prepare_settled_provider_recovery(grant['scope'], run_id='run', workspace=str(f.repo), rooms=['r'], seats=['s'], dispatch_sender='human', dispatch_room='r', dispatch_sha256=digest(content.encode('utf-8')))
         f.owner.db.execute("UPDATE controls SET body=? WHERE kind='grant'", (encode(grant),))
         register_policy(f.box, self.adapter.router)
@@ -365,6 +374,17 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
             f.box.event(db, None, 'RUNTIME_BINDINGS', {'run_id': 'run', 'bindings': [{'settings_sha256': 'fixture-settings', 'runtime': 'codex', 'workspace': str(f.repo), 'model': 'test-model', 'effort': 'high'}]})
         error = {'message': 'fixture provider failure', 'codexErrorInfo': info}
         source = wiring.RPC_SERVER.replace("if args and not marker.exists():", "if not marker.exists():\n   marker.touch()\n   error=" + repr(error) + "\n   print(json.dumps({'method':'error','params':{'threadId':thread,'turnId':'turn','error':error,'willRetry':False}}),flush=True)\n   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn','status':'failed','error':error,'items':[]}}}),flush=True)\n  elif args and not marker.exists():")
+        if effects:
+            # Anonymous fixture command executes locally. It is not a model or a live safety test.
+            source = source.replace('   error=', "   import subprocess\n   subprocess.run([sys.executable,'-c','pass'],check=True)\n   item={'id':'command-fixture','type':'commandExecution','command':'synthetic command','status':'completed','exitCode':0}\n   print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':'turn','item':item}}),flush=True)\n   print(json.dumps({'method':'safetyBuffering','params':{'threadId':thread,'turnId':'turn'}}),flush=True)\n   error=")
+            original_start = self.adapter._start_turn
+            async def start_with_ack(params):
+                response = await original_start(params)
+                operation, attempt = self.adapter.current.get()
+                f.box.prepare_send('synthetic-ack', operation, {'content':'fixture acknowledged message'})
+                f.box.sent('synthetic-ack', {'id':'synthetic-message-id'})
+                return response
+            self.adapter._start_turn = start_with_ack
         before = tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone())
         with patch.object(wiring, 'RPC_SERVER', source):
             msg = PlatformMessage('dispatch', 'r', content, 'human', 'User', 'fixture human', 'text', {}, datetime.now(timezone.utc))
@@ -377,14 +397,28 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_provider_retry').fetchone()[0], 0)
                 self.assertTrue(self.events('PROVIDER_RECOVERY_BLOCKED'))
                 self.assertIsNone(f.box.next_ready('s'))
+                def counts():
+                    db = f.owner.db
+                    return (db.execute('SELECT COUNT(*) FROM c_recovery').fetchone()[0],
+                            db.execute("SELECT COUNT(*) FROM c_work WHERE input LIKE '%peer_blocker%'").fetchone()[0],
+                            db.execute("SELECT COUNT(*) FROM c_event WHERE kind='COORDINATOR_BLOCKER_QUEUED'").fetchone()[0],
+                            len(self.events('SETTLED_NATIVE_PROVIDER')),
+                            len(self.events('PROVIDER_RETRY_SCHEDULED')))
+                self.assertEqual(counts(), (0,1,1,0,0))
                 # A manual wake must not create a fresh thread or hide refusal.
                 self.adapter._wake()
                 await self.settle()
                 starts = [e for e in self.events('STDIN_RPC') if e['payload'].get('method') == 'thread/start']
                 self.assertEqual(len(starts), 1)
                 self.assertEqual(len(self.events('TURN_ACCEPTED')), 1)
+                self.assertEqual(counts(), (0,1,1,0,0))
                 self.assertEqual(before, tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone()))
-                self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_outbox').fetchone()[0], 0)
+                self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_outbox').fetchone()[0], int(effects))
+                if effects:
+                    self.assertEqual(f.owner.db.execute('SELECT state FROM c_outbox').fetchone()[0], 'ACKED')
+                    methods = [e['payload'].get('method') for e in self.events('STDOUT_RPC')]
+                    self.assertIn('safetyBuffering', methods)
+                    self.assertIn('item/completed', methods)
                 return
             self.assertEqual(len(rows), 3, self.events('PROVIDER_RECOVERY_BLOCKED'))  # initial completed fixture + parent + child
             parent, child = rows[-2:]

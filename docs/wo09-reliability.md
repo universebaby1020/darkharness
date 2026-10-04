@@ -17,6 +17,14 @@ and explicitly preserving test scope and literal evidence quotations. These do
 not establish why an earlier refusal occurred or whether wording will change
 future model behavior. No live filter experiment has been performed.
 
+The follow-up candidate accepts preceding retryable native error frames only
+for the same client, thread and turn, before the single definitive error frame
+matching the completed turn. This applies to the existing zero-effect provider
+path; the explicit capacity action keeps its original single-frame contract.
+Repeated blocker notifications retain the same child but now emit their durable
+event only on the first insert. A restart reuses this identity. Multiple harmless
+wake requests must not be confused with multiple blocker works or events.
+
 Operator observation/shutdown helpers are separately versioned operational
 artifacts, not installed by this product commit. They require their own evidence
 and future readiness before use. This candidate alone does not qualify a new

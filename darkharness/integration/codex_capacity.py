@@ -176,7 +176,21 @@ def _terminal_evidence(db, parent, router, *, provider=False):
         raise IntegrationError('NOT_NATIVE_CAPACITY_FAILURE')
     if not isinstance(native.get('items'), list) or any(i.get('type') != 'userMessage' for i in native['items']):
         raise IntegrationError('CAPACITY_EFFECT_OBSERVED')
-    error = one('STDOUT_RPC', lambda b: b.get('payload', {}).get('method') == 'error')
+    error_frames = [(r,b) for r,b in events if r['kind'] == 'STDOUT_RPC' and b.get('payload', {}).get('method') == 'error']
+    if provider:
+        terminal_errors = [(r,b) for r,b in error_frames if b.get('payload', {}).get('params', {}).get('willRetry') is False]
+        if len(terminal_errors) != 1:
+            raise IntegrationError('CAPACITY_NATIVE_ERROR_MISMATCH')
+        error = terminal_errors[0]
+        for r,b in error_frames:
+            p = b.get('payload', {}).get('params', {})
+            if (b.get('client_id') != client or p.get('threadId') != thread or p.get('turnId') != turn or
+                    not isinstance(p.get('error'), dict) or
+                    (r['seq'] != error[0]['seq'] and (p.get('willRetry') is not True or r['seq'] >= error[0]['seq']))):
+                raise IntegrationError('CAPACITY_NATIVE_ERROR_MISMATCH')
+    else:
+        # Explicit capacity action keeps its original single-frame contract.
+        error = one('STDOUT_RPC', lambda b: b.get('payload', {}).get('method') == 'error')
     params = error[1]['payload']['params']
     if (params['threadId'] != thread or params['turnId'] != turn or
             params['error'] != expected_error or params['willRetry'] is not False):
