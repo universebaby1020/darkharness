@@ -65,7 +65,7 @@ def register_policy(box, router):
 
 def bind_dispatch(box, router, msg):
     """Called only from authenticated SDK room intake, never a model tool."""
-    if msg.sender_type not in {'user', 'human'}:
+    if msg.sender_type not in {'User', 'user', 'human'}:
         return
     with box.owner.transaction(box.owner.epoch) as db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='c_provider_policy'").fetchone():

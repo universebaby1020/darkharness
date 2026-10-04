@@ -144,6 +144,104 @@ class CheckerBoundaryTests(unittest.TestCase):
         self.assertEqual(f.owner.db.execute('SELECT COUNT(*) FROM c_verification_continuation').fetchone()[0], 0)
 
 
+class ProviderDispatchIntakeTests(unittest.IsolatedAsyncioTestCase):
+    """Actual SDK types/formatter at durable intake; no network or model turn."""
+    asyncSetUp = wiring.OwnedSdkTests.asyncSetUp
+    asyncTearDown = wiring.OwnedSdkTests.asyncTearDown
+
+    def prepare_dispatch(self, *, raw_hash=False):
+        from datetime import datetime, timezone
+        from band.core.types import PlatformMessage
+        from band.runtime.formatters import replace_uuid_mentions
+        from darkharness.integration.mailbox import encode, digest
+        from darkharness.integration.provider_recovery import prepare_settled_provider_recovery, register_policy
+        roster = [
+            {'id': '00000000-0000-4000-8000-000000000001', 'handle': 'synthetic-seat', 'name': 'Synthetic Seat', 'type': 'Agent'},
+            {'id': '00000000-0000-4000-8000-000000000002', 'handle': None, 'name': ' Synthetic   Reviewer ', 'type': 'Agent'},
+        ]
+        raw = '@[[00000000-0000-4000-8000-000000000001]] @[[00000000-0000-4000-8000-000000000002]] exact synthetic directive'
+        content = replace_uuid_mentions(raw, roster)
+        self.assertEqual(content, '@synthetic-seat @Synthetic-Reviewer exact synthetic directive')
+        self.assertNotEqual(digest(raw.encode('utf-8')), digest(content.encode('utf-8')))
+        f = self.fixture
+        grant = json.loads(f.owner.db.execute("SELECT body FROM controls WHERE kind='grant'").fetchone()[0])
+        grant['scope'] = prepare_settled_provider_recovery(grant['scope'], run_id='run', workspace=str(f.repo), rooms=['r'], seats=['s'], dispatch_sender='human', dispatch_room='r', dispatch_sha256=digest((raw if raw_hash else content).encode('utf-8')))
+        f.owner.db.execute("UPDATE controls SET body=? WHERE kind='grant'", (encode(grant),))
+        register_policy(f.box, self.adapter.router)
+        self.grant_before = tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone())
+        return PlatformMessage('synthetic-dispatch', 'r', content, 'human', 'User', 'Synthetic Human', 'text', {}, datetime.now(timezone.utc))
+
+    async def intake(self, msg):
+        from band.integrations.codex.types import CodexSessionState
+        # Exercise DurableSeatMixin.on_message, stopping only the worker wake.
+        with patch.object(self.adapter, '_wake'), patch.object(self.adapter, '_hydrate_startup_tools', new=AsyncMock()):
+            await self.adapter.on_message(msg, self.tools, CodexSessionState(), None, None, is_session_bootstrap=True, room_id='r')
+
+    def receipts(self):
+        return self.fixture.owner.db.execute('SELECT * FROM c_run_dispatch').fetchall()
+
+    async def test_sdk_user_transformed_content_binds_immutable_receipt(self):
+        from darkharness.integration.mailbox import digest
+        msg = self.prepare_dispatch()
+        await self.intake(msg)
+        self.assertEqual(len(self.receipts()), 1)
+        row = self.receipts()[0]
+        self.assertEqual((row['platform_id'], row['dispatched_at']), (msg.id, msg.created_at.timestamp()))
+        pinned = self.fixture.owner.db.execute('SELECT hash FROM c_provider_policy').fetchone()[0]
+        self.assertEqual(row['policy_hash'], pinned)
+        proof = json.loads(self.fixture.owner.db.execute('SELECT body FROM c_artifact WHERE hash=?', (row['evidence_ref'],)).fetchone()[0])
+        self.assertEqual(proof['content_sha256'], digest(msg.content.encode('utf-8')))
+        await self.intake(msg)  # identical delivery is idempotent
+        self.assertEqual(len(self.receipts()), 1)
+        self.assertEqual(tuple(row), tuple(self.receipts()[0]))
+        self.assertEqual(self.grant_before, tuple(self.fixture.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone()))
+
+    async def test_exact_sender_room_content_and_sender_class_fences(self):
+        from dataclasses import replace
+        msg = self.prepare_dispatch()
+        cases = [{'sender_id': 'other-human'}, {'room_id': 'other-room'},
+                 {'content': msg.content + ' '}, {'content': msg.content.lower()},
+                 *({'sender_type': kind} for kind in ('Agent', 'agent', 'USER', 'Human', 'system', ''))]
+        for n, changes in enumerate(cases):
+            with self.subTest(changes=changes):
+                await self.intake(replace(msg, id='wrong-' + str(n), **changes))
+                self.assertEqual(len(self.receipts()), 0)
+        await self.intake(msg)
+        self.assertEqual(len(self.receipts()), 1)
+
+    async def test_raw_wire_preregistration_does_not_match_sdk_intake(self):
+        msg = self.prepare_dispatch(raw_hash=True)
+        await self.intake(msg)
+        self.assertEqual(len(self.receipts()), 0)
+
+    async def test_timestamp_and_ambiguous_duplicate_fences(self):
+        from dataclasses import replace
+        from datetime import datetime, timezone, timedelta
+        msg = self.prepare_dispatch()
+        for n, at in enumerate((datetime.fromtimestamp(1, timezone.utc), datetime.now(timezone.utc) + timedelta(hours=1))):
+            with self.assertRaisesRegex(IntegrationError, 'DISPATCH_POLICY_NOT_PREREGISTERED'):
+                await self.intake(replace(msg, id='wrong-time-' + str(n), created_at=at))
+            self.assertEqual(len(self.receipts()), 0)
+        with self.assertRaisesRegex(IntegrationError, 'DISPATCH_UTC_TIMESTAMP_REQUIRED'):
+            await self.intake(replace(msg, id='naive-time', created_at=msg.created_at.replace(tzinfo=None)))
+        await self.intake(msg)
+        before = tuple(self.receipts()[0])
+        for changes in ({'id': 'ambiguous-second-dispatch'}, {'created_at': msg.created_at + timedelta(microseconds=1)}):
+            with self.assertRaisesRegex(IntegrationError, 'DISPATCH_RECEIPT_CONFLICT'):
+                await self.intake(replace(msg, **changes))
+            self.assertEqual(tuple(self.receipts()[0]), before)
+
+    async def test_changed_policy_cannot_bind(self):
+        from darkharness.integration.mailbox import encode
+        msg = self.prepare_dispatch()
+        f = self.fixture
+        grant = json.loads(self.grant_before[0])
+        grant['scope']['provider_dispatch']['sender_id'] = 'changed-human'
+        f.owner.db.execute("UPDATE controls SET body=? WHERE kind='grant'", (encode(grant),))
+        await self.intake(msg)
+        self.assertEqual(len(self.receipts()), 0)
+
+
 class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = wiring.OwnedSdkTests.asyncSetUp
     async def asyncTearDown(self):
@@ -225,7 +323,10 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         from band.integrations.codex.types import CodexSessionState
         f = self.fixture
         grant = json.loads(f.owner.db.execute("SELECT body FROM controls WHERE kind='grant'").fetchone()[0])
-        grant['scope'] = prepare_settled_provider_recovery(grant['scope'], run_id='run', workspace=str(f.repo), rooms=['r'], seats=['s'], dispatch_sender='human', dispatch_room='r', dispatch_sha256=digest(b'original provider task'))
+        from band.runtime.formatters import replace_uuid_mentions
+        roster = [{'id': '00000000-0000-4000-8000-000000000003', 'handle': 'synthetic-builder', 'name': 'Synthetic Builder', 'type': 'Agent'}]
+        content = replace_uuid_mentions('@[[00000000-0000-4000-8000-000000000003]] original provider task', roster)
+        grant['scope'] = prepare_settled_provider_recovery(grant['scope'], run_id='run', workspace=str(f.repo), rooms=['r'], seats=['s'], dispatch_sender='human', dispatch_room='r', dispatch_sha256=digest(content.encode('utf-8')))
         f.owner.db.execute("UPDATE controls SET body=? WHERE kind='grant'", (encode(grant),))
         register_policy(f.box, self.adapter.router)
         self.adapter.thread_ownership.binding = 'fixture-settings'
@@ -237,7 +338,7 @@ class PreStartSdkTests(unittest.IsolatedAsyncioTestCase):
         source = wiring.RPC_SERVER.replace("if args and not marker.exists():", "if not marker.exists():\n   marker.touch()\n   error={'message':'fixture overloaded','codexErrorInfo':'serverOverloaded'}\n   print(json.dumps({'method':'error','params':{'threadId':thread,'turnId':'turn','error':error,'willRetry':False}}),flush=True)\n   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn','status':'failed','error':error,'items':[]}}}),flush=True)\n  elif args and not marker.exists():")
         before = tuple(f.owner.db.execute("SELECT body,revision FROM controls WHERE kind='grant'").fetchone())
         with patch.object(wiring, 'RPC_SERVER', source):
-            msg = PlatformMessage('dispatch', 'r', 'original provider task', 'human', 'user', 'fixture human', 'text', {}, datetime.now(timezone.utc))
+            msg = PlatformMessage('dispatch', 'r', content, 'human', 'User', 'fixture human', 'text', {}, datetime.now(timezone.utc))
             await self.adapter.on_message(msg, self.tools, CodexSessionState(), None, None, is_session_bootstrap=True, room_id='r')
             await self.settle()
             rows = f.owner.db.execute("SELECT * FROM c_work WHERE seat='s' ORDER BY rowid").fetchall()

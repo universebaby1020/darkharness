@@ -202,6 +202,14 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(IntegrationError, 'CONFLICT'):
             bind_dispatch(self.box, self.router, self.dispatch)
 
+    def test_exact_supported_human_sender_representations(self):
+        for kind in ('User', 'user', 'human', 'Agent', 'agent', 'USER', 'Human', 'system', ''):
+            with self.subTest(sender_type=kind):
+                self.owner.db.execute('DELETE FROM c_run_dispatch')
+                self.dispatch.sender_type = kind
+                bind_dispatch(self.box, self.router, self.dispatch)
+                self.assertEqual(self.owner.db.execute('SELECT COUNT(*) FROM c_run_dispatch').fetchone()[0], int(kind in ('User', 'user', 'human')))
+
     def test_no_telemetry_native_token_delta_is_still_fenced(self):
         for n in (1, 2):
             self.rpc('STDOUT_RPC', {'method': 'thread/tokenUsage/updated', 'params': {'threadId': 'thread', 'turnId': 'turn', 'tokenUsage': {'total': {'inputTokens': n, 'outputTokens': 0, 'reasoningOutputTokens': 0, 'totalTokens': n}}}})

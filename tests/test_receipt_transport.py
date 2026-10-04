@@ -165,20 +165,40 @@ class ReceiptFacadeTests(unittest.TestCase):
 
     def test_thread_started_then_raised_retains_owned_cleanup(self):
         import threading
-        original_start = threading.Thread.start
+        real_start = threading.Thread.start
+        rapid = threading.Thread(target=lambda: None)
+        def original_start(thread):
+            value = real_start(thread)
+            if thread is rapid:
+                # Force Thread.run's cleanup before the wrapper resumes; the
+                # global start patch also sees unrelated short-lived threads.
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(hasattr(thread, '_target'))
+            return value
         def uncertain_checker_start(thread):
+            # Thread.run deletes _target on completion, even before start()
+            # returns. Capture ownership before starting any real thread.
+            is_checker = thread._target == self.bridge.broker._run
             value = original_start(thread)
-            if thread._target == self.bridge.broker._run:
+            if is_checker:
                 raise RuntimeError('fixture after actual start')
             return value
         with patch('darkharness.integration.verification.threading.Thread.start', new=uncertain_checker_start):
+            rapid.start()
             denied = self.verify(self.receipt)
         self.assertFalse(denied.ok)
+        self.assertEqual(denied.value['error'], 'VERIFICATION_START_UNKNOWN')
         self.assertFalse(denied.value['same_input_safe_retry'])
         self.assertNotEqual(denied.value['effect_phase'], 'NOT_STARTED')
-        self.bridge.broker.close()
+        self.assertEqual(denied.value['retry_diagnostic'], 'OWN_EFFECT_EXISTS')
         job = self.bridge.broker.jobs[self.effect]
         self.assertIsNotNone(job.thread)
+        self.assertIsNotNone(job.thread.ident)
+        self.assertTrue(job.cancel.is_set())
+        with patch.object(job.thread, 'join', wraps=job.thread.join) as joined:
+            self.bridge.broker.close()
+        joined.assert_called_once_with(timeout=5)
         self.assertFalse(job.thread.is_alive())
         self.assertTrue(job.done.is_set())
 

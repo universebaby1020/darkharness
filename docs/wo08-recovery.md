@@ -46,6 +46,19 @@ dispatch_room, dispatch_sha256(첫 지시 `PlatformMessage.content` UTF-8의 SHA
 이 함수는 pure scope 준비 함수이고 Grant를 발급·기록하지 않는다. 기존 scope의
 workspace/room/seat ceiling을 넓히지 않는다. 실행 중 capability를 추가하지 않는다.
 
+**raw Band 본문과 SDK intake 본문은 별개다.** SDK4는 `on_message` 전에
+`band.runtime.formatters.replace_uuid_mentions(content, participants)`로 `@[[id]]`를
+`@handle`로 치환한다. handle이 없으면 공백을 합친 이름(`@Synthetic-Reviewer` 형태)을
+사용한다. 따라서 raw wire UTF-8 hash가 맞아도 SDK intake hash와 다를 수 있다.
+Main은 **dispatch 전** 인증된 정확한 participant roster(`id/handle/name/type`)와
+정확히 pin한 설치 SDK 버전·formatter 소스로 실제 intake 변환을 수행하고, 그 결과의
+UTF-8 SHA-256을 `dispatch_sha256`으로 사전 등록해야 한다. roster/SDK 소스 pin과 raw
+wire hash는 별도 operator evidence로 보존한다. 문자열 유사도, mention 제거, 임의
+공백/대소문자 보정, raw/intake 이중 허용은 하지 않는다. dispatch 후 Grant를 고치거나
+이번 후보를 운영 중인 C sweep에 설치하지 않는다. 새 authority issuer나 네트워크
+readback API는 필요하지 않다. 이 변경은 WO08 D 제출 factory 후보이며, Main의
+사전 설정 교정과 이후 독립 clone/E2E/guard 검증은 별도다.
+
 등록되는 exact capability:
 
 ```text
@@ -59,7 +72,9 @@ provider_dispatch = {sender_id, room_id, content_sha256}
 `max_attempts`와 backoff는 exact integer다. 사용자 확정 정책은 dispatch 후 8시간이며
 별도 임의 기본값이나 Grant expiry 재기록으로 계산하지 않는다. adapter가 시작될 때
 owner의 `c_provider_policy`에 body/hash/등록시각을 immutable하게 보관한다. 다른 body의
-재등록은 실패한다. 인증된 SDK room intake의 user/human 메시지만 dispatch를 결속한다.
+재등록은 실패한다. 인증된 SDK room intake의 `User`(SDK4 사용자), 기존 `user`/`human`
+메시지만 dispatch를 결속한다. `Agent`/`agent` 및 임의 sender class는 허용하지 않으며
+대소문자를 일괄 정규화하지 않는다.
 정확한 sender/room/content hash, platform message id, timezone-aware created_at을
 `c_run_dispatch` 및 hash-backed artifact에 보관한다. created_at은 정책 등록 이후,
 현재 관측시각 이전이어야 한다. 첫 receipt는 바꿀 수 없다. Main은 실제 SDK에 들어올
